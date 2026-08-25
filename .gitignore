@@ -1,0 +1,13 @@
+# Compiled binary
+*.exe
+shuttle
+
+# Temporary files
+temporary_file.txt
+
+# Freebuff workspace
+.freebuff/
+
+# OS files
+.DS_Store
+Thumbs.db
