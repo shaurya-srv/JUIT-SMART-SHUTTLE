@@ -1,6 +1,7 @@
 #include<stdio.h>
 #include<string.h>
 #include<stdlib.h>
+#include<conio.h>
 
 //data storage of student
 struct student {
@@ -9,6 +10,7 @@ struct student {
     char room_number[60];
     char hostel_name[30];
     char phone_number[15];
+    char password[31];
 };
 //data storage of pickup and drop request
 struct pickuprequest {
@@ -44,6 +46,113 @@ struct bus {
 #define MAX_BUSES 50
 #define BUS_SCHEDULE_FILE "busschedule.txt"
 #define BUS_ASSIGNMENTS_FILE "busassignments.txt"
+#define STUDENT_PASSWORDS_FILE "studentpasswords.txt"
+#define CREDENTIALS_FILE "credentials.txt"
+
+// Forward declarations
+void guardmenu(void);
+void busSchedulerPortal(void);
+void guardportal(void);
+void viewrequests(char filename[], char title[]);
+
+// ============================================================
+// AUTHENTICATION & PASSWORD HELPERS
+// ============================================================
+
+// Read password with masked input (shows * instead of characters)
+void read_password(char *buffer, int size) {
+    int i = 0;
+    int ch;
+    while (1) {
+        ch = getch();
+        if (ch == '\r' || ch == '\n') {
+            break;
+        } else if (ch == 8) {           // backspace
+            if (i > 0) {
+                i--;
+                printf("\b \b");
+            }
+        } else if (ch == 27) {          // Escape – cancel
+            buffer[0] = '\0';
+            printf("\n");
+            return;
+        } else if (i < size - 1) {
+            buffer[i++] = (char)ch;
+            printf("*");
+        }
+    }
+    buffer[i] = '\0';
+    printf("\n");
+}
+
+// Save a student password (roll_number + password, one line each)
+void saveStudentPassword(int roll_number, const char *password) {
+    FILE *f = fopen(STUDENT_PASSWORDS_FILE, "a");
+    if (f == NULL) {
+        printf("\nError: Could not create password file.\n");
+        return;
+    }
+    fprintf(f, "%d\n", roll_number);
+    fprintf(f, "%s\n", password);
+    fclose(f);
+}
+
+// Verify a student's password
+int verifyStudentPassword(int roll_number, const char *password) {
+    FILE *f = fopen(STUDENT_PASSWORDS_FILE, "r");
+    if (f == NULL) return 0;
+
+    int stored_roll;
+    char stored_pass[31];
+    while (fscanf(f, "%d\n", &stored_roll) == 1) {
+        if (fgets(stored_pass, sizeof(stored_pass), f) == NULL) break;
+        stored_pass[strcspn(stored_pass, "\n")] = '\0';
+        if (stored_roll == roll_number && strcmp(stored_pass, password) == 0) {
+            fclose(f);
+            return 1;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+// Create credentials.txt with default passwords if it doesn't exist
+void createDefaultCredentials(void) {
+    FILE *f = fopen(CREDENTIALS_FILE, "r");
+    if (f != NULL) {
+        fclose(f);
+        return;   // already exists
+    }
+    f = fopen(CREDENTIALS_FILE, "w");
+    if (f == NULL) return;
+    fprintf(f, "guard guard123\n");
+    fprintf(f, "scheduler scheduler123\n");
+    fclose(f);
+    printf("\n[INFO] Default credentials created in %s\n", CREDENTIALS_FILE);
+    printf("  Guard password:      guard123\n");
+    printf("  Scheduler password:  scheduler123\n");
+    printf("  (Change these for production use)\n");
+}
+
+// Verify a role's password from credentials.txt
+int verifyRolePassword(const char *role, const char *password) {
+    FILE *f = fopen(CREDENTIALS_FILE, "r");
+    if (f == NULL) return 0;
+
+    char file_role[32], file_pass[32];
+    while (fscanf(f, "%31s %31s", file_role, file_pass) == 2) {
+        if (strcmp(file_role, role) == 0 && strcmp(file_pass, password) == 0) {
+            fclose(f);
+            return 1;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+// ============================================================
+// END AUTHENTICATION HELPERS
+// ============================================================
 
 // Helper: get a human-readable route name from a bus
 void getBusRouteName(struct bus *b, char *buf, int size) {
@@ -169,7 +278,14 @@ void studentregistration(struct student *s) {
     scanf(" %[^\n]", s->hostel_name);
     printf("Enter your phone number: ");
     scanf(" %[^\n]", s->phone_number);
-    getchar(); // consume the newline character left in the input buffer
+
+    // Password
+    printf("Enter a password: ");
+    read_password(s->password, sizeof(s->password));
+    if (s->password[0] == '\0') {
+        printf("\nPassword cannot be empty. Registration cancelled.\n");
+        return;
+    }
 
     FILE *file;
     file = fopen("studentregistration.txt", "a");
@@ -185,6 +301,10 @@ void studentregistration(struct student *s) {
     fprintf(file, "%s\n", s->phone_number);
 
     fclose(file);
+
+    // Save password to password file
+    saveStudentPassword(s->student_roll_no, s->password);
+
     printf("\nStudent registration successful!\n");
 
 }
@@ -266,48 +386,38 @@ int chooseLocation() {
     return choice - 1;
 }
 //function to create request and save it in the file
+// Uses the logged-in student directly (no roll number prompt)
 int createpickuprequest(struct student *s, struct pickuprequest *request) {
 
     printf("\nCREATE PICKUP REQUEST\n");
-    
-    int roll_number;
-    printf("Enter your roll number: ");
-    roll_number = read_int();
-    if (!findstudent(roll_number, s)) {
-        printf("Student not found.\n");
+    printf("Logged in as: %s (Roll: %d)\n", s->name, s->student_roll_no);
+
+    printf("\nAvailable locations:\n");
+    printf("1. JUIT\n");
+    printf("2. Ravli PG\n");
+    printf("3. Peach Tree\n");
+    printf("4. Waknaghat\n");
+
+    printf("\nEnter pickup place: ");
+    scanf(" %[^\n]", request->pickup_place);
+
+    printf("Enter dropoff place: ");
+    scanf(" %[^\n]", request->dropoff_place);
+
+    request->pickup_location = getLocationNumber(request->pickup_place);
+    request->dropoff_location = getLocationNumber(request->dropoff_place);
+
+    if (request->pickup_location == -1 || request->dropoff_location == -1) {
+        printf("\nInvalid pickup or dropoff location.\n");
         return 0;
     }
-    else {
-        printf("Student found: %s\n", s->name);
-        printf("\nAvailable locations:\n");
-        printf("1. JUIT\n");
-        printf("2. Ravli PG\n");
-        printf("3. Peach Tree\n");
-        printf("4. Waknaghat\n");
 
-        printf("\nEnter pickup place: ");
-        scanf(" %[^\n]", request->pickup_place);
-
-        printf("Enter dropoff place: ");
-        scanf(" %[^\n]", request->dropoff_place);
-
-        request->pickup_location = getLocationNumber(request->pickup_place);
-        request->dropoff_location = getLocationNumber(request->dropoff_place);
-
-        if (request->pickup_location == -1 || request->dropoff_location == -1) {
-            printf("\nInvalid pickup or dropoff location.\n");
-            return 0;
-        }
-
-        if (request->pickup_location == request->dropoff_location) {
-            printf("\nPickup and dropoff cannot be the same location.\n");
-            return 0;
-        }
-        request->direction = getDirection(request->pickup_location,request->dropoff_location);
+    if (request->pickup_location == request->dropoff_location) {
+        printf("\nPickup and dropoff cannot be the same location.\n");
+        return 0;
     }
-       
 
-    //data direction
+    request->direction = getDirection(request->pickup_location, request->dropoff_location);
     request->student_roll_number = s->student_roll_no;
     strcpy(request->status, "PENDING_APPROVAL");
     request->bus_number = 0;
@@ -496,6 +606,8 @@ void assignRequests(void) {
 
     struct pickuprequest req;
     int assigned_count = 0;
+    int warned_buses[MAX_BUSES];   // track which buses triggered a warning
+    int warned_count = 0;
 
     // Read each approved request and try to assign it
     while (fscanf(af, "%d\n", &req.request_number) == 1) {
@@ -525,6 +637,30 @@ void assignRequests(void) {
                 // Assign this request to this bus
                 buses[i].current_count++;
 
+                // Capacity warning: 80% or more
+                if (buses[i].current_count * 100 / buses[i].max_capacity >= 80) {
+                    // Only warn once per bus per run
+                    int already_warned = 0;
+                    for (int w = 0; w < warned_count; w++) {
+                        if (warned_buses[w] == buses[i].bus_number) {
+                            already_warned = 1;
+                            break;
+                        }
+                    }
+                    if (!already_warned) {
+                        char routename[80];
+                        getBusRouteName(&buses[i], routename, sizeof(routename));
+                        printf("\n[WARNING] Bus %d (%s) is at %d/%d capacity (%.0f%%)",
+                               buses[i].bus_number, routename,
+                               buses[i].current_count, buses[i].max_capacity,
+                               (double)buses[i].current_count * 100.0 / buses[i].max_capacity);
+                        if (buses[i].current_count == buses[i].max_capacity)
+                            printf(" -- FULL");
+                        printf("\n");
+                        warned_buses[warned_count++] = buses[i].bus_number;
+                    }
+                }
+
                 // Record the assignment
                 FILE *bf = fopen(BUS_ASSIGNMENTS_FILE, "a");
                 if (bf != NULL) {
@@ -545,6 +681,9 @@ void assignRequests(void) {
 
     if (assigned_count > 0) {
         printf("\n%d request(s) assigned to buses.\n", assigned_count);
+        if (warned_count > 0) {
+            printf("%d bus(es) are at 80%%+ capacity. Consider adding more buses on those routes.\n", warned_count);
+        }
     } else {
         printf("\nNo new requests could be assigned.\n");
         printf("Possible reasons: no buses on matching routes, or all buses are full.\n");
@@ -905,6 +1044,39 @@ void guardportal(void) {
     }
 
 }
+
+void guardmenu(void){
+    int choice;
+    while (1)
+    {
+        printf("\nGUARD PORTAL");
+        printf("\n1. Process Pending Requests");
+        printf("\n2. View Approved Requests");
+        printf("\n3. View Rejected Requests");
+        printf("\n4. Exit Guard Portal");
+        printf("\nEnter your choice: ");
+
+        choice = read_int();
+
+        if (choice == 1){
+            guardportal();
+        }
+        else if (choice == 2){
+            viewrequests("approvedrequest.txt", "APPROVED REQUESTS");
+        }
+        else if (choice == 3){
+            viewrequests("rejectedrequest.txt", "REJECTED REQUESTS");
+        }
+        else if (choice == 4){
+            printf("\nExiting Guard Portal...\n");
+            break;
+        }
+        else{
+            printf("\nInvalid choice. Try again.\n");
+        }
+    }
+}
+
 void viewrequests(char filename[], char title[]){
     FILE *file;
     struct student s;
@@ -975,13 +1147,11 @@ void viewrequests(char filename[], char title[]){
 
     fclose(file);
 }
-void studentrequeststatus(void){
-    int roll_number;
+void studentrequeststatus(int roll_number){
     int found = 0;
 
-    printf("\nCHECK REQUEST STATUS");
-    printf("\nEnter your roll number: ");
-    roll_number = read_int();
+    printf("\nCHECK REQUEST STATUS\n");
+
     FILE *pendingfile = fopen("pendingrequest.txt", "r");
 
     if (pendingfile != NULL)
@@ -1099,32 +1269,30 @@ void studentrequeststatus(void){
         printf("\nNo processed requests found for Roll Number %d.\n", roll_number);
     }
 }
-void studentportal(void){
-    struct student current_student;
+
+// Student portal — receives the already logged-in student
+void studentportal(struct student *current_student){
     struct pickuprequest current_request;
     int choice;
 
     while (1)
     {
         printf("\nSTUDENT PORTAL");
-        printf("\n1. Register Student");
-        printf("\n2. Create Pickup Request");
-        printf("\n3. Check Request Status");
-        printf("\n4. Exit Student Portal");
+        printf("\nLogged in as: %s (Roll: %d)", current_student->name, current_student->student_roll_no);
+        printf("\n1. Create Pickup Request");
+        printf("\n2. Check Request Status");
+        printf("\n3. Exit Student Portal");
         printf("\nEnter your choice: ");
         choice = read_int();
         if (choice == 1){
-            studentregistration(&current_student);
-        }
-        else if (choice == 2){
-            if (createpickuprequest(&current_student, &current_request)){
+            if (createpickuprequest(current_student, &current_request)){
                 saverequest(&current_request);
             }
         }
-        else if (choice == 3){
-            studentrequeststatus();
+        else if (choice == 2){
+            studentrequeststatus(current_student->student_roll_no);
         }
-        else if (choice == 4){
+        else if (choice == 3){
             printf("\nExiting Student Portal...\n");
             break;
         }
@@ -1133,68 +1301,155 @@ void studentportal(void){
         }
     }
 }
-void guardmenu(void){
-    int choice;
-    while (1)
-    {
-        printf("\nGUARD PORTAL");
-        printf("\n1. Process Pending Requests");
-        printf("\n2. View Approved Requests");
-        printf("\n3. View Rejected Requests");
-        printf("\n4. Exit Guard Portal");
-        printf("\nEnter your choice: ");
 
-        choice = read_int();
+// Student registration page — register then auto-login
+void studentRegisterAndLogin(void) {
+    struct student s;
+    studentregistration(&s);
 
-        if (choice == 1){
-            guardportal();
-        }
-        else if (choice == 2){
-            viewrequests("approvedrequest.txt", "APPROVED REQUESTS");
-        }
-        else if (choice == 3){
-            viewrequests("rejectedrequest.txt", "REJECTED REQUESTS");
-        }
-        else if (choice == 4){
-            printf("\nExiting Guard Portal...\n");
-            break;
-        }
-        else{
-            printf("\nInvalid choice. Try again.\n");
-        }
+    // Auto-login if registration succeeded (password was saved)
+    if (s.password[0] != '\0') {
+        printf("\nLogging you in...\n");
+        studentportal(&s);
     }
 }
 
-int main() {
+// Student login page
+void studentLoginPage(void) {
+    int roll_number;
+    char password[31];
+    struct student s;
+    int attempts = 0;
+
+    printf("\nSTUDENT LOGIN\n");
+    printf("Enter your roll number: ");
+    roll_number = read_int();
+
+    if (!findstudent(roll_number, &s)) {
+        printf("\nStudent not found. Please register first.\n");
+        return;
+    }
+
+    while (attempts < 3) {
+        printf("Enter your password: ");
+        read_password(password, sizeof(password));
+
+        if (verifyStudentPassword(roll_number, password)) {
+            printf("\nLogin successful! Welcome, %s.\n", s.name);
+            studentportal(&s);
+            return;
+        }
+
+        attempts++;
+        if (attempts < 3)
+            printf("\nIncorrect password. %d attempt(s) remaining.\n", 3 - attempts);
+    }
+
+    printf("\nToo many failed attempts. Returning to main menu.\n");
+}
+
+// Guard login page
+void guardLoginPage(void) {
+    char password[31];
+    int attempts = 0;
+
+    printf("\nGUARD LOGIN\n");
+
+    while (attempts < 3) {
+        printf("Enter guard password: ");
+        read_password(password, sizeof(password));
+
+        if (verifyRolePassword("guard", password)) {
+            printf("\nGuard login successful!\n");
+            guardmenu();
+            return;
+        }
+
+        attempts++;
+        if (attempts < 3)
+            printf("\nIncorrect password. %d attempt(s) remaining.\n", 3 - attempts);
+    }
+
+    printf("\nToo many failed attempts. Returning to main menu.\n");
+}
+
+// Bus scheduler login page
+void busSchedulerLoginPage(void) {
+    char password[31];
+    int attempts = 0;
+
+    printf("\nBUS SCHEDULER LOGIN\n");
+
+    while (attempts < 3) {
+        printf("Enter scheduler password: ");
+        read_password(password, sizeof(password));
+
+        if (verifyRolePassword("scheduler", password)) {
+            printf("\nBus scheduler login successful!\n");
+            busSchedulerPortal();
+            return;
+        }
+
+        attempts++;
+        if (attempts < 3)
+            printf("\nIncorrect password. %d attempt(s) remaining.\n", 3 - attempts);
+    }
+
+    printf("\nToo many failed attempts. Returning to main menu.\n");
+}
+
+// ============================================================
+// LOGIN PAGE
+// ============================================================
+void loginPage(void) {
+    createDefaultCredentials();
+
     int choice;
     while (1) {
         printf("\n========================================");
         printf("\n       JUIT SMART SHUTTLE");
         printf("\n========================================");
-        printf("\n1. Student Portal");
-        printf("\n2. Guard Portal");
-        printf("\n3. Bus Scheduler Portal");
-        printf("\n4. Exit");
-        printf("\nEnter your choice: ");
+        printf("\n");
+        printf("\n  1. Student Portal");
+        printf("\n  2. Guard Portal");
+        printf("\n  3. Bus Scheduler Portal");
+        printf("\n  4. Exit");
+        printf("\n\nEnter your choice: ");
         choice = read_int();
 
         if (choice == 1) {
-            studentportal();
+            // Student: Register or Login
+            int sub;
+            printf("\n--- Student ---");
+            printf("\n1. Register");
+            printf("\n2. Login");
+            printf("\nEnter your choice: ");
+            sub = read_int();
+            if (sub == 1) {
+                studentRegisterAndLogin();
+            } else if (sub == 2) {
+                studentLoginPage();
+            } else {
+                printf("\nInvalid choice.\n");
+            }
         }
         else if (choice == 2) {
-            guardmenu();
+            guardLoginPage();
         }
         else if (choice == 3) {
-            busSchedulerPortal();
+            busSchedulerLoginPage();
         }
         else if (choice == 4) {
-            printf("\nExiting JUIT Smart Shuttle\n");
+            printf("\nThank you for using JUIT Smart Shuttle. Goodbye!\n");
             break;
         }
         else {
             printf("\nInvalid choice.\n");
         }
     }
+}
 
+int main() {
+    loginPage();
     return 0;
 }
