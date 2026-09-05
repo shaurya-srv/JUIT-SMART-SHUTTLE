@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JUIT Smart Shuttle</title>
+<style>
+  :root {
+    --primary: #1a73e8;
+    --primary-dark: #1557b0;
+    --accent: #34a853;
+    --danger: #ea4335;
+    --warn: #fbbc04;
+    --bg: #f0f4f8;
+    --card: #ffffff;
+    --text: #202124;
+    --text-light: #5f6368;
+    --border: #dadce0;
+    --radius: 10px;
+    --shadow: 0 2px 8px rgba(0,0,0,.1);
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .app-header {
+    background: linear-gradient(135deg, var(--primary), #0d47a1);
+    color: #fff;
+    width: 100%;
+    padding: 18px 24px;
+    text-align: center;
+    box-shadow: 0 2px 12px rgba(0,0,0,.15);
+  }
+  .app-header h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: .5px; }
+  .app-header p { font-size: .85rem; opacity: .85; margin-top: 2px; }
+  .container {
+    width: 100%;
+    max-width: 520px;
+    padding: 24px 16px;
+    flex: 1;
+  }
+  .card {
+    background: var(--card);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 28px 24px;
+    margin-bottom: 16px;
+  }
+  .card h2 {
+    font-size: 1.15rem;
+    margin-bottom: 18px;
+    color: var(--primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card h2 .icon { font-size: 1.3rem; }
+  .welcome-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    padding: 10px 14px;
+    background: #e8f0fe;
+    border-radius: 8px;
+    font-size: .85rem;
+  }
+  .welcome-bar strong { color: var(--primary-dark); }
+  label {
+    display: block;
+    font-size: .8rem;
+    font-weight: 600;
+    color: var(--text-light);
+    margin-bottom: 4px;
+    margin-top: 12px;
+  }
+  input, select {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1.5px solid var(--border);
+    border-radius: 8px;
+    font-size: .95rem;
+    transition: border-color .2s;
+    background: #fafafa;
+  }
+  input:focus, select:focus {
+    outline: none;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(26,115,232,.15);
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 10px 20px;
+    border: none;
+    border-radius: 8px;
+    font-size: .9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all .2s;
+    width: 100%;
+    margin-top: 16px;
+  }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-primary:hover { background: var(--primary-dark); }
+  .btn-success { background: var(--accent); color: #fff; }
+  .btn-success:hover { background: #2d9249; }
+  .btn-danger { background: var(--danger); color: #fff; }
+  .btn-danger:hover { background: #d32f2f; }
+  .btn-outline {
+    background: transparent;
+    color: var(--primary);
+    border: 1.5px solid var(--primary);
+  }
+  .btn-outline:hover { background: #e8f0fe; }
+  .btn-sm { padding: 7px 14px; font-size: .8rem; width: auto; margin-top: 8px; }
+  .btn-group { display: flex; gap: 8px; margin-top: 16px; }
+  .btn-group .btn { flex: 1; }
+  .menu-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-top: 14px;
+  }
+  .menu-btn {
+    padding: 18px 12px;
+    border: 1.5px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--card);
+    cursor: pointer;
+    text-align: center;
+    transition: all .2s;
+    font-size: .85rem;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .menu-btn:hover {
+    border-color: var(--primary);
+    background: #e8f0fe;
+    color: var(--primary);
+  }
+  .menu-btn .menu-icon { font-size: 1.6rem; display: block; margin-bottom: 6px; }
+  .menu-btn.danger-zone { border-color: var(--danger); color: var(--danger); }
+  .menu-btn.danger-zone:hover { background: #fce8e6; }
+  .alert {
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: .85rem;
+    margin-bottom: 12px;
+  }
+  .alert-success { background: #e6f4ea; color: #137333; }
+  .alert-error { background: #fce8e6; color: #c5221f; }
+  .alert-info { background: #e8f0fe; color: #1967d2; }
+  .alert-warn { background: #fef7e0; color: #b06000; }
+  .list-item {
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    font-size: .85rem;
+    transition: all .2s;
+  }
+  .list-item:hover { border-color: var(--primary); }
+  .list-item .label { color: var(--text-light); font-size: .75rem; }
+  .list-item .value { font-weight: 600; margin-top: 2px; }
+  .list-item .row { display: flex; justify-content: space-between; align-items: center; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 20px;
+    font-size: .7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+  .badge-pending { background: #fef7e0; color: #b06000; }
+  .badge-approved { background: #e6f4ea; color: #137333; }
+  .badge-rejected { background: #fce8e6; color: #c5221f; }
+  .badge-full { background: var(--danger); color: #fff; }
+  .badge-warn { background: var(--warn); color: #333; }
+  .capacity-bar {
+    height: 8px;
+    background: #e0e0e0;
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 6px 0;
+  }
+  .capacity-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width .3s;
+  }
+  .hidden { display: none !important; }
+  .divider {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 14px 0;
+  }
+  .text-center { text-align: center; }
+  .text-muted { color: var(--text-light); font-size: .8rem; }
+  .password-wrap {
+    position: relative;
+  }
+  .password-wrap input { padding-right: 40px; }
+  .password-toggle {
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 1.1rem;
+    color: var(--text-light);
+  }
+  .back-link {
+    display: inline-block;
+    margin-bottom: 14px;
+    color: var(--primary);
+    font-size: .85rem;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .back-link:hover { text-decoration: underline; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: .82rem;
+    margin-top: 10px;
+  }
+  th, td {
+    padding: 8px 10px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--text-light); font-weight: 600; font-size: .75rem; text-transform: uppercase; }
+  .empty-state {
+    text-align: center;
+    padding: 30px 20px;
+    color: var(--text-light);
+  }
+  .empty-state .icon { font-size: 2.5rem; margin-bottom: 8px; }
+  .footer {
+    text-align: center;
+    padding: 16px;
+    font-size: .75rem;
+    color: var(--text-light);
+  }
+</style>
+</head>
+<body>
+
+<div class="app-header">
+  <h1>🚌 JUIT Smart Shuttle</h1>
+  <p>Shuttle Request & Management System</p>
+</div>
+
+<div class="container" id="app"></div>
+<div class="footer">JUIT Smart Shuttle &copy; 2026</div>
+
+<script>
+// ============================================================
+// DATA LAYER (localStorage)
+// ============================================================
+const DB = {
+  get(k, d) { try { return JSON.parse(localStorage.getItem('jss_'+k)) || d; } catch { return d; } },
+  set(k, v)  { localStorage.setItem('jss_'+k, JSON.stringify(v)); },
+};
+
+// Seed default credentials if first run
+if (!DB.get('cred_init')) {
+  DB.set('credentials', { guard: 'guard123', scheduler: 'scheduler123' });
+  DB.set('students', []);
+  DB.set('requests', []);
+  DB.set('buses', []);
+  DB.set('assignments', []);
+  DB.set('cred_init', true);
+}
+
+// Helpers
+let nextId = (key) => {
+  const ids = DB.get(key, []).map(x => x.id);
+  return ids.length ? Math.max(...ids) + 1 : 1;
+};
+const LOCATIONS = ['JUIT', 'Ravli PG', 'Peach Tree', 'Waknaghat'];
+const locName = (i) => LOCATIONS[i] || 'Unknown';
+const locIndex = (s) => LOCATIONS.indexOf(s);
+const routeName = (p, d) => `${locName(p)} → ${locName(d)}`;
+
+// Current session
+let session = DB.get('session', null);
+
+function saveSession() { DB.set('session', session); }
+function clearSession() { session = null; DB.set('session', null); }
+
+// ============================================================
+// RENDERING
+// ============================================================
+const $app = document.getElementById('app');
+
+function render(html) { $app.innerHTML = html; }
+
+// ---------- LOGIN PAGE ----------
+function showLogin() {
+  render(`
+    <div class="card">
+      <h2><span class="icon">🔐</span> Login</h2>
+      <div id="alert"></div>
+      <label>Role</label>
+      <select id="role">
+        <option value="student">Student</option>
+        <option value="guard">Guard</option>
+        <option value="scheduler">Bus Scheduler</option>
+      </select>
+      <div id="rollField">
+        <label>Roll Number</label>
+        <input type="number" id="roll" placeholder="Enter roll number">
+      </div>
+      <div class="password-wrap">
+        <label>Password</label>
+        <input type="password" id="pass" placeholder="Enter password">
+        <button class="password-toggle" onclick="togglePass()">👁</button>
+      </div>
+      <button class="btn btn-primary" onclick="doLogin()">Login</button>
+      <hr class="divider">
+      <button class="btn btn-outline" onclick="showRegister()">📝 Register New Student</button>
+    </div>
+  `);
+  document.getElementById('role').addEventListener('change', e => {
+    document.getElementById('rollField').classList.toggle('hidden', e.target.value !== 'student');
+  });
+}
+
+function togglePass() {
+  const p = document.getElementById('pass');
+  p.type = p.type === 'password' ? 'text' : 'password';
+}
+
+function doLogin() {
+  const role = document.getElementById('role').value;
+  const pass = document.getElementById('pass').value;
+  if (!pass) return showAlert('alert', 'Please enter a password.', 'error');
+
+  if (role === 'student') {
+    const roll = parseInt(document.getElementById('roll').value);
+    if (!roll) return showAlert('alert', 'Please enter your roll number.', 'error');
+    const students = DB.get('students', []);
+    const s = students.find(x => x.roll === roll);
+    if (!s) return showAlert('alert', 'Student not found. Please register first.', 'error');
+    if (s.password !== pass) return showAlert('alert', 'Incorrect password.', 'error');
+    session = { role: 'student', roll: roll, name: s.name };
+    saveSession();
+    showStudentPortal();
+  } else {
+    const creds = DB.get('credentials', {});
+    const key = role === 'guard' ? 'guard' : 'scheduler';
+    if (creds[key] !== pass) return showAlert('alert', 'Incorrect password.', 'error');
+    session = { role };
+    saveSession();
+    if (role === 'guard') showGuardPortal();
+    else showBusSchedulerPortal();
+  }
+}
+
+function showAlert(id, msg, type) {
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = `<div class="alert alert-${type}">${msg}</div>`;
+}
+
+// ---------- REGISTER ----------
+function showRegister() {
+  render(`
+    <a class="back-link" onclick="showLogin()">← Back to Login</a>
+    <div class="card">
+      <h2><span class="icon">📝</span> Student Registration</h2>
+      <div id="alert"></div>
+      <label>Roll Number</label>
+      <input type="number" id="reg_roll" placeholder="e.g. 261030195">
+      <label>Name</label>
+      <input type="text" id="reg_name" placeholder="Full name">
+      <label>Room Number</label>
+      <input type="text" id="reg_room" placeholder="e.g. 26">
+      <label>Hostel</label>
+      <select id="reg_hostel">
+        <option>Peach Tree</option>
+        <option>Ravli PG</option>
+        <option>Geeta Bhavan</option>
+        <option>Waknaghat</option>
+      </select>
+      <label>Phone Number</label>
+      <input type="tel" id="reg_phone" placeholder="10-digit number">
+      <div class="password-wrap">
+        <label>Create Password</label>
+        <input type="password" id="reg_pass" placeholder="Min 4 characters">
+      </div>
+      <button class="btn btn-success" onclick="doRegister()">Register</button>
+    </div>
+  `);
+}
+
+function doRegister() {
+  const roll = parseInt(document.getElementById('reg_roll').value);
+  const name = document.getElementById('reg_name').value.trim();
+  const room = document.getElementById('reg_room').value.trim();
+  const hostel = document.getElementById('reg_hostel').value;
+  const phone = document.getElementById('reg_phone').value.trim();
+  const pass = document.getElementById('reg_pass').value;
+
+  if (!roll || !name || !room || !phone || !pass)
+    return showAlert('alert', 'All fields are required.', 'error');
+  if (pass.length < 4)
+    return showAlert('alert', 'Password must be at least 4 characters.', 'error');
+
+  const students = DB.get('students', []);
+  if (students.find(s => s.roll === roll))
+    return showAlert('alert', 'A student with this roll number already exists.', 'error');
+
+  students.push({ roll, name, room, hostel, phone, password: pass });
+  DB.set('students', students);
+  showAlert('alert', 'Registration successful! You can now login.', 'success');
+  setTimeout(showLogin, 1500);
+}
+
+// ---------- STUDENT PORTAL ----------
+function showStudentPortal() {
+  const s = DB.get('students', []).find(x => x.roll === session.roll);
+  render(`
+    <div class="welcome-bar">
+      <span>Welcome, <strong>${s.name}</strong></span>
+      <span class="text-muted">Roll: ${s.roll}</span>
+    </div>
+    <div class="card">
+      <h2><span class="icon">🎓</span> Student Portal</h2>
+      <div class="menu-grid">
+        <div class="menu-btn" onclick="showCreateRequest()"><span class="menu-icon">🚗</span>Create Pickup Request</div>
+        <div class="menu-btn" onclick="showStudentStatus()"><span class="menu-icon">📋</span>Check Request Status</div>
+      </div>
+      <hr class="divider">
+      <button class="btn btn-outline btn-sm" onclick="doLogout()" style="width:100%">🚪 Logout</button>
+    </div>
+  `);
+}
+
+function showCreateRequest() {
+  render(`
+    <a class="back-link" onclick="showStudentPortal()">← Back</a>
+    <div class="card">
+      <h2><span class="icon">🚗</span> Create Pickup Request</h2>
+      <div id="alert"></div>
+      <label>Pickup Location</label>
+      <select id="req_pickup">
+        ${LOCATIONS.map((l,i) => `<option value="${i}">${l}</option>`).join('')}
+      </select>
+      <label>Dropoff Location</label>
+      <select id="req_dropoff">
+        ${LOCATIONS.map((l,i) => `<option value="${i}" ${i===1?'selected':''}>${l}</option>`).join('')}
+      </select>
+      <button class="btn btn-primary" onclick="submitRequest()">Submit Request</button>
+    </div>
+  `);
+}
+
+function submitRequest() {
+  const pickup = parseInt(document.getElementById('req_pickup').value);
+  const dropoff = parseInt(document.getElementById('req_dropoff').value);
+  if (pickup === dropoff) return showAlert('alert', 'Pickup and dropoff must be different.', 'error');
+
+  const requests = DB.get('requests', []);
+  requests.push({
+    id: nextId('requests'),
+    studentRoll: session.roll,
+    pickup, dropoff,
+    pickupName: locName(pickup),
+    dropoffName: locName(dropoff),
+    status: 'PENDING_APPROVAL',
+    busNumber: null,
+    createdAt: Date.now()
+  });
+  DB.set('requests', requests);
+  showAlert('alert', 'Request submitted successfully!', 'success');
+  setTimeout(showStudentPortal, 1200);
+}
+
+function showStudentStatus() {
+  const requests = DB.get('requests', []).filter(r => r.studentRoll === session.roll);
+  const buses = DB.get('buses', []);
+  const assigns = DB.get('assignments', []);
+
+  let html = `
+    <a class="back-link" onclick="showStudentPortal()">← Back</a>
+    <div class="card">
+      <h2><span class="icon">📋</span> My Requests</h2>
+  `;
+  if (!requests.length) {
+    html += `<div class="empty-state"><div class="icon">📭</div><p>No requests yet.</p></div>`;
+  } else {
+    requests.slice().reverse().forEach(r => {
+      const busInfo = assigns.find(a => a.requestId === r.id);
+      const busLabel = busInfo ? `Bus #${busInfo.busNumber}` : 'Not assigned';
+      html += `
+        <div class="list-item">
+          <div class="row">
+            <span class="label">Request #${r.id}</span>
+            <span class="badge badge-${r.status === 'APPROVED' ? 'approved' : r.status === 'REJECTED' ? 'rejected' : 'pending'}">${r.status.replace('_',' ')}</span>
+          </div>
+          <div class="value">${r.pickupName} → ${r.dropoffName}</div>
+          <div class="text-muted" style="margin-top:4px">🚌 ${busLabel}</div>
+        </div>`;
+    });
+  }
+  html += '</div>';
+  render(html);
+}
+
+// ---------- GUARD PORTAL ----------
+function showGuardPortal() {
+  const pending = DB.get('requests', []).filter(r => r.status === 'PENDING_APPROVAL');
+  render(`
+    <div class="welcome-bar">
+      <span>🧑‍✈️ <strong>Guard Portal</strong></span>
+      <span class="badge badge-pending">${pending.length} pending</span>
+    </div>
+    <div class="card">
+      <h2><span class="icon">🛡️</span> Guard Dashboard</h2>
+      <div class="menu-grid">
+        <div class="menu-btn" onclick="showPendingRequests()"><span class="menu-icon">📥</span>Process Requests <br><small class="text-muted">${pending.length} pending</small></div>
+        <div class="menu-btn" onclick="showApprovedList()"><span class="menu-icon">✅</span>Approved</div>
+        <div class="menu-btn" onclick="showRejectedList()"><span class="menu-icon">❌</span>Rejected</div>
+      </div>
+      <hr class="divider">
+      <button class="btn btn-outline btn-sm" onclick="doLogout()" style="width:100%">🚪 Logout</button>
+    </div>
+  `);
+}
+
+function showPendingRequests() {
+  const requests = DB.get('requests', []);
+  const pending = requests.filter(r => r.status === 'PENDING_APPROVAL');
+  const students = DB.get('students', []);
+
+  let html = `
+    <a class="back-link" onclick="showGuardPortal()">← Back</a>
+    <div class="card">
+      <h2><span class="icon">📥</span> Pending Requests (${pending.length})</h2>
+  `;
+  if (!pending.length) {
+    html += `<div class="empty-state"><div class="icon">✅</div><p>No pending requests.</p></div>`;
+  }
+  pending.forEach(r => {
+    const s = students.find(x => x.roll === r.studentRoll);
+    html += `
+      <div class="list-item">
+        <div class="row">
+          <span class="label">Request #${r.id}</span>
+          <span class="badge badge-pending">PENDING</span>
+        </div>
+        <div class="value">${s ? s.name : 'Unknown'} (Roll: ${r.studentRoll})</div>
+        <div class="text-muted">${s ? `${s.hostel} · Room ${s.room} · ${s.phone}` : ''}</div>
+        <div style="margin-top:6px;font-weight:600">${r.pickupName} → ${r.dropoffName}</div>
+        <div class="btn-group">
+          <button class="btn btn-success btn-sm" onclick="decideRequest(${r.id},'APPROVED')">✅ Approve</button>
+          <button class="btn btn-danger btn-sm" onclick="decideRequest(${r.id},'REJECTED')">❌ Reject</button>
+        </div>
+      </div>`;
+  });
+  html += '</div>';
+  render(html);
+}
+
+function decideRequest(id, status) {
+  const requests = DB.get('requests', []);
+  const r = requests.find(x => x.id === id);
+  if (r) { r.status = status; DB.set('requests', requests); }
+  showPendingRequests();
+}
+
+function showApprovedList() { showRequestList('APPROVED', '✅ Approved Requests'); }
+function showRejectedList() { showRequestList('REJECTED', '❌ Rejected Requests'); }
+
+function showRequestList(status, title) {
+  const requests = DB.get('requests', []).filter(r => r.status === status);
+  const students = DB.get('students', []);
+  const assigns = DB.get('assignments', []);
+
+  let html = `
+    <a class="back-link" onclick="showGuardPortal()">← Back</a>
+    <div class="card">
+      <h2>${title} (${requests.length})</h2>
+  `;
+  if (!requests.length) {
+    html += `<div class="empty-state"><div class="icon">📭</div><p>No ${status.toLowerCase()} requests.</p></div>`;
+  }
+  requests.forEach(r => {
+    const s = students.find(x => x.roll === r.studentRoll);
+    const busInfo = assigns.find(a => a.requestId === r.id);
+    html += `
+      <div class="list-item">
+        <div class="row">
+          <span class="label">Request #${r.id}</span>
+          <span class="badge badge-${status === 'APPROVED' ? 'approved' : 'rejected'}">${status}</span>
+        </div>
+        <div class="value">${s ? s.name : 'Unknown'} (Roll: ${r.studentRoll})</div>
+        <div>${r.pickupName} → ${r.dropoffName}</div>
+        ${busInfo ? `<div class="text-muted">🚌 Bus #${busInfo.busNumber}</div>` : ''}
+      </div>`;
+  });
+  html += '</div>';
+  render(html);
+}
+
+// ---------- BUS SCHEDULER PORTAL ----------
+function showBusSchedulerPortal() {
+  render(`
+    <div class="welcome-bar">
+      <span>🚌 <strong>Bus Scheduler Portal</strong></span>
+    </div>
+    <div class="card">
+      <h2><span class="icon">🗓️</span> Bus Scheduler</h2>
+      <div class="menu-grid">
+        <div class="menu-btn" onclick="showRegisterBus()"><span class="menu-icon">➕</span>Register Bus</div>
+        <div class="menu-btn" onclick="doAutoAssign()"><span class="menu-icon">🔄</span>Auto-Assign</div>
+        <div class="menu-btn" onclick="showBusSchedule()"><span class="menu-icon">📊</span>Bus Schedule</div>
+        <div class="menu-btn" onclick="showRouteCapacity()"><span class="menu-icon">🗺️</span>Route Capacity</div>
+      </div>
+      <hr class="divider">
+      <button class="btn btn-outline btn-sm" onclick="doLogout()" style="width:100%">🚪 Logout</button>
+    </div>
+  `);
+}
+
+function showRegisterBus() {
+  render(`
+    <a class="back-link" onclick="showBusSchedulerPortal()">← Back</a>
+    <div class="card">
+      <h2><span class="icon">➕</span> Register New Bus</h2>
+      <div id="alert"></div>
+      <label>Route Pickup</label>
+      <select id="bus_pickup">
+        ${LOCATIONS.map((l,i) => `<option value="${i}">${l}</option>`).join('')}
+      </select>
+      <label>Route Dropoff</label>
+      <select id="bus_dropoff">
+        ${LOCATIONS.map((l,i) => `<option value="${i}" ${i===2?'selected':''}>${l}</option>`).join('')}
+      </select>
+      <label>Max Capacity</label>
+      <input type="number" id="bus_cap" value="20" min="1" max="30">
+      <button class="btn btn-primary" onclick="registerBus()">Register Bus</button>
+    </div>
+  `);
+}
+
+function registerBus() {
+  const pickup = parseInt(document.getElementById('bus_pickup').value);
+  const dropoff = parseInt(document.getElementById('bus_dropoff').value);
+  const cap = parseInt(document.getElementById('bus_cap').value);
+  if (pickup === dropoff) return showAlert('alert', 'Pickup and dropoff must differ.', 'error');
+  if (cap < 1 || cap > 30) return showAlert('alert', 'Capacity must be 1–30.', 'error');
+
+  const buses = DB.get('buses', []);
+  const id = buses.length ? Math.max(...buses.map(b => b.id)) + 1 : 1;
+  buses.push({ id, pickup, dropoff, count: 0, maxCapacity: cap });
+  DB.set('buses', buses);
+  showAlert('alert', `Bus #${id} registered: ${routeName(pickup, dropoff)} (cap: ${cap})`, 'success');
+  setTimeout(showBusSchedulerPortal, 1200);
+}
+
+function doAutoAssign() {
+  const buses = DB.get('buses', []);
+  const requests = DB.get('requests', []);
+  const assignments = DB.get('assignments', []);
+  const approved = requests.filter(r => r.status === 'APPROVED' && !assignments.find(a => a.requestId === r.id));
+
+  if (!buses.length) return alert('No buses registered. Register buses first.');
+  if (!approved.length) return alert('No unassigned approved requests.');
+
+  let count = 0;
+  const warns = new Set();
+
+  approved.forEach(r => {
+    const bus = buses.find(b => b.pickup === r.pickup && b.dropoff === r.dropoff && b.count < b.maxCapacity);
+    if (bus) {
+      bus.count++;
+      assignments.push({ requestId: r.id, busNumber: bus.id });
+      r.busNumber = bus.id;
+      if (bus.count / bus.maxCapacity >= 0.8) warns.add(bus.id);
+    }
+  });
+
+  DB.set('buses', buses);
+  DB.set('assignments', assignments);
+  DB.set('requests', requests);
+  count = assignments.length - (assignments.length - approved.filter(r => r.busNumber).length);
+
+  let msg = `${approved.filter(r => r.busNumber).length} request(s) assigned.`;
+  if (warns.size) msg += ` ⚠️ ${warns.size} bus(es) at 80%+ capacity!`;
+  alert(msg);
+  showBusSchedulerPortal();
+}
+
+function showBusSchedule() {
+  const buses = DB.get('buses', []);
+  const assignments = DB.get('assignments', []);
+  const requests = DB.get('requests', []);
+  const students = DB.get('students', []);
+
+  let html = `
+    <a class="back-link" onclick="showBusSchedulerPortal()">← Back</a>
+    <div class="card">
+      <h2><span class="icon">📊</span> Bus Schedule</h2>
+  `;
+  if (!buses.length) {
+    html += `<div class="empty-state"><div class="icon">🚌</div><p>No buses registered.</p></div>`;
+  }
+  buses.forEach(bus => {
+    const pct = Math.round((bus.count / bus.maxCapacity) * 100);
+    const color = pct >= 80 ? 'var(--danger)' : pct >= 50 ? 'var(--warn)' : 'var(--accent)';
+    const busAssignments = assignments.filter(a => a.busNumber === bus.id);
+
+    html += `
+      <div class="list-item">
+        <div class="row">
+          <span style="font-weight:700">🚌 Bus #${bus.id}</span>
+          ${pct >= 100 ? '<span class="badge badge-full">FULL</span>' : pct >= 80 ? '<span class="badge badge-warn">80%+</span>' : ''}
+        </div>
+        <div class="value">${routeName(bus.pickup, bus.dropoff)}</div>
+        <div class="capacity-bar"><div class="capacity-fill" style="width:${pct}%;background:${color}"></div></div>
+        <div class="text-muted">${bus.count} / ${bus.maxCapacity} seats (${bus.maxCapacity - bus.count} available)</div>
+    `;
+    if (busAssignments.length) {
+      html += `<div style="margin-top:6px;font-size:.78rem;color:var(--text-light)">Assigned:</div>`;
+      busAssignments.forEach(a => {
+        const r = requests.find(x => x.id === a.requestId);
+        const s = r ? students.find(x => x.roll === r.studentRoll) : null;
+        html += `<div style="font-size:.8rem;padding:2px 0">• ${s ? s.name : 'Unknown'} — ${r ? r.pickupName + '→' + r.dropoffName : ''}</div>`;
+      });
+    }
+    html += '</div>';
+  });
+  html += '</div>';
+  render(html);
+}
+
+function showRouteCapacity() {
+  const buses = DB.get('buses', []);
+  let html = `
+    <a class="back-link" onclick="showBusSchedulerPortal()">← Back</a>
+    <div class="card">
+      <h2><span class="icon">🗺️</span> Route Capacity</h2>
+  `;
+  if (!buses.length) {
+    html += `<div class="empty-state"><div class="icon">🗺️</div><p>No buses registered.</p></div>`;
+  } else {
+    html += '<table><tr><th>Route</th><th>Buses</th><th>Assigned</th><th>Capacity</th><th>Available</th></tr>';
+    for (let p = 0; p < 4; p++) {
+      for (let d = 0; d < 4; d++) {
+        if (p === d) continue;
+        const routeBuses = buses.filter(b => b.pickup === p && b.dropoff === d);
+        if (!routeBuses.length) continue;
+        const totalCap = routeBuses.reduce((s, b) => s + b.maxCapacity, 0);
+        const totalAssigned = routeBuses.reduce((s, b) => s + b.count, 0);
+        html += `<tr>
+          <td style="font-weight:600">${locName(p)} → ${locName(d)}</td>
+          <td>${routeBuses.length}</td>
+          <td>${totalAssigned}</td>
+          <td>${totalCap}</td>
+          <td style="color:${totalCap - totalAssigned === 0 ? 'var(--danger)' : 'var(--accent)'};font-weight:600">${totalCap - totalAssigned}</td>
+        </tr>`;
+      }
+    }
+    html += '</table>';
+  }
+  html += '</div>';
+  render(html);
+}
+
+// ---------- LOGOUT ----------
+function doLogout() {
+  clearSession();
+  showLogin();
+}
+
+// ---------- INIT ----------
+if (session) {
+  if (session.role === 'student') showStudentPortal();
+  else if (session.role === 'guard') showGuardPortal();
+  else showBusSchedulerPortal();
+} else {
+  showLogin();
+}
+</script>
+</body>
+</html>
