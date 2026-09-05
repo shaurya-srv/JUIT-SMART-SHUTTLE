@@ -1302,102 +1302,6 @@ void studentportal(struct student *current_student){
     }
 }
 
-// Student registration page — register then auto-login
-void studentRegisterAndLogin(void) {
-    struct student s;
-    studentregistration(&s);
-
-    // Auto-login if registration succeeded (password was saved)
-    if (s.password[0] != '\0') {
-        printf("\nLogging you in...\n");
-        studentportal(&s);
-    }
-}
-
-// Student login page
-void studentLoginPage(void) {
-    int roll_number;
-    char password[31];
-    struct student s;
-    int attempts = 0;
-
-    printf("\nSTUDENT LOGIN\n");
-    printf("Enter your roll number: ");
-    roll_number = read_int();
-
-    if (!findstudent(roll_number, &s)) {
-        printf("\nStudent not found. Please register first.\n");
-        return;
-    }
-
-    while (attempts < 3) {
-        printf("Enter your password: ");
-        read_password(password, sizeof(password));
-
-        if (verifyStudentPassword(roll_number, password)) {
-            printf("\nLogin successful! Welcome, %s.\n", s.name);
-            studentportal(&s);
-            return;
-        }
-
-        attempts++;
-        if (attempts < 3)
-            printf("\nIncorrect password. %d attempt(s) remaining.\n", 3 - attempts);
-    }
-
-    printf("\nToo many failed attempts. Returning to main menu.\n");
-}
-
-// Guard login page
-void guardLoginPage(void) {
-    char password[31];
-    int attempts = 0;
-
-    printf("\nGUARD LOGIN\n");
-
-    while (attempts < 3) {
-        printf("Enter guard password: ");
-        read_password(password, sizeof(password));
-
-        if (verifyRolePassword("guard", password)) {
-            printf("\nGuard login successful!\n");
-            guardmenu();
-            return;
-        }
-
-        attempts++;
-        if (attempts < 3)
-            printf("\nIncorrect password. %d attempt(s) remaining.\n", 3 - attempts);
-    }
-
-    printf("\nToo many failed attempts. Returning to main menu.\n");
-}
-
-// Bus scheduler login page
-void busSchedulerLoginPage(void) {
-    char password[31];
-    int attempts = 0;
-
-    printf("\nBUS SCHEDULER LOGIN\n");
-
-    while (attempts < 3) {
-        printf("Enter scheduler password: ");
-        read_password(password, sizeof(password));
-
-        if (verifyRolePassword("scheduler", password)) {
-            printf("\nBus scheduler login successful!\n");
-            busSchedulerPortal();
-            return;
-        }
-
-        attempts++;
-        if (attempts < 3)
-            printf("\nIncorrect password. %d attempt(s) remaining.\n", 3 - attempts);
-    }
-
-    printf("\nToo many failed attempts. Returning to main menu.\n");
-}
-
 // ============================================================
 // LOGIN PAGE
 // ============================================================
@@ -1410,37 +1314,97 @@ void loginPage(void) {
         printf("\n       JUIT SMART SHUTTLE");
         printf("\n========================================");
         printf("\n");
-        printf("\n  1. Student Portal");
-        printf("\n  2. Guard Portal");
-        printf("\n  3. Bus Scheduler Portal");
-        printf("\n  4. Exit");
+        printf("\n  1. Student Login");
+        printf("\n  2. Guard Login");
+        printf("\n  3. Bus Scheduler Login");
+        printf("\n  4. Register (New Student)");
+        printf("\n  5. Exit");
         printf("\n\nEnter your choice: ");
         choice = read_int();
 
         if (choice == 1) {
-            // Student: Register or Login
-            int sub;
-            printf("\n--- Student ---");
-            printf("\n1. Register");
-            printf("\n2. Login");
-            printf("\nEnter your choice: ");
-            sub = read_int();
-            if (sub == 1) {
-                studentRegisterAndLogin();
-            } else if (sub == 2) {
-                studentLoginPage();
-            } else {
-                printf("\nInvalid choice.\n");
+            // Student login: roll number + password
+            int roll_number;
+            char password[31];
+            struct student s;
+            int attempts = 0;
+
+            printf("\n--- STUDENT LOGIN ---\n");
+            printf("Enter roll number: ");
+            roll_number = read_int();
+
+            if (!findstudent(roll_number, &s)) {
+                printf("\nStudent not found. Please register first.\n");
+                continue;
             }
+
+            while (attempts < 3) {
+                printf("Enter password: ");
+                read_password(password, sizeof(password));
+
+                if (verifyStudentPassword(roll_number, password)) {
+                    printf("\nWelcome, %s!\n", s.name);
+                    studentportal(&s);
+                    break;
+                }
+                attempts++;
+                if (attempts < 3)
+                    printf("Incorrect password. %d attempt(s) remaining.\n", 3 - attempts);
+            }
+            if (attempts == 3)
+                printf("\nToo many failed attempts.\n");
         }
         else if (choice == 2) {
-            guardLoginPage();
+            // Guard login: password only
+            char password[31];
+            int attempts = 0;
+
+            printf("\n--- GUARD LOGIN ---\n");
+            while (attempts < 3) {
+                printf("Enter password: ");
+                read_password(password, sizeof(password));
+
+                if (verifyRolePassword("guard", password)) {
+                    printf("\nWelcome!\n");
+                    guardmenu();
+                    break;
+                }
+                attempts++;
+                if (attempts < 3)
+                    printf("Incorrect password. %d attempt(s) remaining.\n", 3 - attempts);
+            }
+            if (attempts == 3)
+                printf("\nToo many failed attempts.\n");
         }
         else if (choice == 3) {
-            busSchedulerLoginPage();
+            // Bus scheduler login: password only
+            char password[31];
+            int attempts = 0;
+
+            printf("\n--- BUS SCHEDULER LOGIN ---\n");
+            while (attempts < 3) {
+                printf("Enter password: ");
+                read_password(password, sizeof(password));
+
+                if (verifyRolePassword("scheduler", password)) {
+                    printf("\nWelcome!\n");
+                    busSchedulerPortal();
+                    break;
+                }
+                attempts++;
+                if (attempts < 3)
+                    printf("Incorrect password. %d attempt(s) remaining.\n", 3 - attempts);
+            }
+            if (attempts == 3)
+                printf("\nToo many failed attempts.\n");
         }
         else if (choice == 4) {
-            printf("\nThank you for using JUIT Smart Shuttle. Goodbye!\n");
+            // Register a new student
+            struct student s;
+            studentregistration(&s);
+        }
+        else if (choice == 5) {
+            printf("\nGoodbye!\n");
             break;
         }
         else {
