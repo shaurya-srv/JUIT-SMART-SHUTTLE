@@ -5,6 +5,10 @@ shuttle
 # Temporary files
 temporary_file.txt
 
+# Bus schedule data
+busschedule.txt
+busassignments.txt
+
 # Freebuff workspace
 .freebuff/
 

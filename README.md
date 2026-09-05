@@ -11,7 +11,9 @@ The system allows:
 - Requests to be temporarily stored and passed to the verification system.
 - Guards to independently access pending requests.
 - Guards to verify student details before approving a request.
-- Approved requests to eventually be integrated into a dynamic bus allocation system.
+- Bus schedulers to register buses with routes and capacity limits.
+- Automatic assignment of approved requests to buses on matching routes.
+- Route-based capacity tracking and management.
 
 ## System Workflow
 
@@ -20,22 +22,20 @@ Student Portal
 │
 │ Create Pickup Request
 ▼
-Request Created
-│
-│ Status: PENDING_APPROVAL
-▼
-Temporary File Storage
+Request Created (PENDING_APPROVAL)
 │
 ▼
 Guard Portal
 │
-│ View Request
+│ Verify & Approve/Reject
 ▼
-Student Verification
-│
-├───────────────┐
-▼               ▼
-APPROVED     REJECTED
+APPROVED ──► Bus Scheduler Portal
+│                │
+│         Register Buses
+│         Auto-Assign to Buses
+│         View Capacity
+▼
+REJECTED
 ```
 
 ## Features
@@ -48,6 +48,13 @@ APPROVED     REJECTED
   - Waknaghat
 - Guard portal for request approval/rejection
 - Request status tracking for students
+- Bus scheduler portal:
+  - Register buses with route and max capacity
+  - Auto-assign approved requests to buses on matching routes
+  - View per-bus schedule with assigned students
+  - View route capacity summary (total seats, assigned, available)
+  - Unassign requests from buses
+- Bus assignment shown in request views and student status
 - File-based data persistence
 
 ## How to Compile and Run
@@ -66,3 +73,5 @@ gcc index.c -o shuttle
 | `pendingrequest.txt` | Pending shuttle requests |
 | `approvedrequest.txt` | Approved shuttle requests |
 | `rejectedrequest.txt` | Rejected shuttle requests |
+| `busschedule.txt` | Bus fleet and route assignments |
+| `busassignments.txt` | Request-to-bus mapping |

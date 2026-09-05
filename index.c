@@ -30,6 +30,31 @@ struct pickuprequest {
 #define RAVLI 1
 #define PEACH_TREE 2
 #define WAKNAGHAT 3
+
+// Bus data storage
+struct bus {
+    int bus_number;
+    int route_pickup;       // pickup location number
+    int route_dropoff;      // dropoff location number
+    int current_count;      // number of students assigned
+    int max_capacity;       // maximum students per bus
+};
+
+#define MAX_BUS_CAPACITY 30
+#define MAX_BUSES 50
+#define BUS_SCHEDULE_FILE "busschedule.txt"
+#define BUS_ASSIGNMENTS_FILE "busassignments.txt"
+
+// Helper: get a human-readable route name from a bus
+void getBusRouteName(struct bus *b, char *buf, int size) {
+    char *loc_names[] = {"JUIT", "Ravli PG", "Peach Tree", "Waknaghat"};
+    if (b->route_pickup >= 0 && b->route_pickup <= 3 &&
+        b->route_dropoff >= 0 && b->route_dropoff <= 3)
+        snprintf(buf, size, "%s -> %s", loc_names[b->route_pickup], loc_names[b->route_dropoff]);
+    else
+        snprintf(buf, size, "Unknown Route");
+}
+
 // function to count the number of requests made by a student (to make the counter static and not reset every time the function is called)
 int getNextRequestNumber(){
     FILE *file;
@@ -285,6 +310,7 @@ int createpickuprequest(struct student *s, struct pickuprequest *request) {
     //data direction
     request->student_roll_number = s->student_roll_no;
     strcpy(request->status, "PENDING_APPROVAL");
+    request->bus_number = 0;
     request->request_number = getNextRequestNumber();
     printf("\nPickup request successfully created!\n");
     return 1;
@@ -314,6 +340,435 @@ void saverequest(struct pickuprequest *request) {
 
     printf("\nRequest saved successfully.\n");
 }
+
+// ============================================================
+// BUS SCHEDULING FUNCTIONS
+// ============================================================
+
+// Load buses from the schedule file. Returns the number loaded.
+int loadBuses(struct bus buses[], int max) {
+    FILE *f = fopen(BUS_SCHEDULE_FILE, "r");
+    if (f == NULL) return 0;
+
+    int count = 0;
+    while (count < max &&
+           fscanf(f, "%d %d %d %d %d",
+                  &buses[count].bus_number,
+                  &buses[count].route_pickup,
+                  &buses[count].route_dropoff,
+                  &buses[count].current_count,
+                  &buses[count].max_capacity) == 5) {
+        count++;
+    }
+    fclose(f);
+    return count;
+}
+
+// Save all buses back to the schedule file.
+void saveBuses(struct bus buses[], int count) {
+    FILE *f = fopen(BUS_SCHEDULE_FILE, "w");
+    if (f == NULL) {
+        printf("\nError: Could not save bus schedule.\n");
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        fprintf(f, "%d %d %d %d %d\n",
+                buses[i].bus_number,
+                buses[i].route_pickup,
+                buses[i].route_dropoff,
+                buses[i].current_count,
+                buses[i].max_capacity);
+    }
+    fclose(f);
+}
+
+// Get the next available bus number (one more than the highest existing).
+int getNextBusNumber(void) {
+    FILE *f = fopen(BUS_SCHEDULE_FILE, "r");
+    if (f == NULL) return 1;
+
+    int num, highest = 0;
+    while (fscanf(f, "%d", &num) == 1) {
+        if (num > highest) highest = num;
+        // skip rest of line
+        int c;
+        while ((c = fgetc(f)) != '\n' && c != EOF);
+    }
+    fclose(f);
+    return highest + 1;
+}
+
+// Register a new bus for a specific route.
+void registerBus(void) {
+    struct bus buses[MAX_BUSES];
+    int count = loadBuses(buses, MAX_BUSES);
+
+    if (count >= MAX_BUSES) {
+        printf("\nMaximum number of buses (%d) reached.\n", MAX_BUSES);
+        return;
+    }
+
+    struct bus newbus;
+    newbus.bus_number = getNextBusNumber();
+    newbus.current_count = 0;
+
+    printf("\nREGISTER NEW BUS\n");
+    printf("Bus Number: %d\n", newbus.bus_number);
+
+    printf("\nAvailable Locations:\n");
+    printf("1. JUIT\n");
+    printf("2. Ravli PG\n");
+    printf("3. Peach Tree\n");
+    printf("4. Waknaghat\n");
+
+    int choice;
+    printf("\nEnter route pickup location: ");
+    choice = read_int();
+    if (choice < 1 || choice > 4) {
+        printf("\nInvalid location.\n");
+        return;
+    }
+    newbus.route_pickup = choice - 1;
+
+    printf("Enter route dropoff location: ");
+    choice = read_int();
+    if (choice < 1 || choice > 4) {
+        printf("\nInvalid location.\n");
+        return;
+    }
+    newbus.route_dropoff = choice - 1;
+
+    if (newbus.route_pickup == newbus.route_dropoff) {
+        printf("\nPickup and dropoff cannot be the same location.\n");
+        return;
+    }
+
+    printf("Enter bus max capacity (1-%d): ", MAX_BUS_CAPACITY);
+    newbus.max_capacity = read_int();
+    if (newbus.max_capacity < 1 || newbus.max_capacity > MAX_BUS_CAPACITY) {
+        printf("\nInvalid capacity.\n");
+        return;
+    }
+
+    buses[count] = newbus;
+    saveBuses(buses, count + 1);
+
+    char routename[80];
+    getBusRouteName(&newbus, routename, sizeof(routename));
+    printf("\nBus %d registered on route: %s (Capacity: %d)\n",
+           newbus.bus_number, routename, newbus.max_capacity);
+}
+
+// Helper: check if a request is already assigned to any bus.
+int isRequestAssigned(int request_number) {
+    FILE *f = fopen(BUS_ASSIGNMENTS_FILE, "r");
+    if (f == NULL) return 0;
+
+    int req_num;
+    while (fscanf(f, "%d", &req_num) == 1) {
+        if (req_num == request_number) {
+            fclose(f);
+            return 1;
+        }
+        // skip rest of line (bus_number)
+        int c;
+        while ((c = fgetc(f)) != '\n' && c != EOF);
+    }
+    fclose(f);
+    return 0;
+}
+
+// Assign approved (unassigned) requests to buses that match their route.
+void assignRequests(void) {
+    struct bus buses[MAX_BUSES];
+    int busCount = loadBuses(buses, MAX_BUSES);
+
+    if (busCount == 0) {
+        printf("\nNo buses registered. Please register buses first.\n");
+        return;
+    }
+
+    FILE *af = fopen("approvedrequest.txt", "r");
+    if (af == NULL) {
+        printf("\nNo approved requests to assign.\n");
+        return;
+    }
+
+    struct pickuprequest req;
+    int assigned_count = 0;
+
+    // Read each approved request and try to assign it
+    while (fscanf(af, "%d\n", &req.request_number) == 1) {
+        fscanf(af, "%d\n", &req.student_roll_number);
+        fgets(req.pickup_place, sizeof(req.pickup_place), af);
+        fgets(req.dropoff_place, sizeof(req.dropoff_place), af);
+        fgets(req.status, sizeof(req.status), af);
+
+        req.pickup_place[strcspn(req.pickup_place, "\n")] = '\0';
+        req.dropoff_place[strcspn(req.dropoff_place, "\n")] = '\0';
+        req.status[strcspn(req.status, "\n")] = '\0';
+
+        // Skip if already assigned
+        if (isRequestAssigned(req.request_number))
+            continue;
+
+        // Resolve location numbers
+        req.pickup_location = getLocationNumber(req.pickup_place);
+        req.dropoff_location = getLocationNumber(req.dropoff_place);
+
+        // Find a bus on the matching route with available capacity
+        for (int i = 0; i < busCount; i++) {
+            if (buses[i].route_pickup == req.pickup_location &&
+                buses[i].route_dropoff == req.dropoff_location &&
+                buses[i].current_count < buses[i].max_capacity) {
+
+                // Assign this request to this bus
+                buses[i].current_count++;
+
+                // Record the assignment
+                FILE *bf = fopen(BUS_ASSIGNMENTS_FILE, "a");
+                if (bf != NULL) {
+                    fprintf(bf, "%d %d\n", req.request_number, buses[i].bus_number);
+                    fclose(bf);
+                }
+
+                assigned_count++;
+                break;  // move to next request
+            }
+        }
+    }
+
+    fclose(af);
+
+    // Save updated bus counts
+    saveBuses(buses, busCount);
+
+    if (assigned_count > 0) {
+        printf("\n%d request(s) assigned to buses.\n", assigned_count);
+    } else {
+        printf("\nNo new requests could be assigned.\n");
+        printf("Possible reasons: no buses on matching routes, or all buses are full.\n");
+    }
+}
+
+// View the bus schedule with capacity and assigned requests.
+void viewBusSchedule(void) {
+    struct bus buses[MAX_BUSES];
+    int busCount = loadBuses(buses, MAX_BUSES);
+
+    if (busCount == 0) {
+        printf("\nNo buses registered yet.\n");
+        return;
+    }
+
+    printf("\n===== BUS SCHEDULE =====\n");
+
+    for (int i = 0; i < busCount; i++) {
+        char routename[80];
+        getBusRouteName(&buses[i], routename, sizeof(routename));
+
+        printf("\n-----------------------------");
+        printf("\nBus Number: %d", buses[i].bus_number);
+        printf("\nRoute: %s", routename);
+        printf("\nCapacity: %d / %d", buses[i].current_count, buses[i].max_capacity);
+
+        // List assigned requests for this bus
+        FILE *af = fopen(BUS_ASSIGNMENTS_FILE, "r");
+        if (af != NULL) {
+            int req_num, bus_num;
+            int found_any = 0;
+            while (fscanf(af, "%d %d\n", &req_num, &bus_num) == 2) {
+                if (bus_num == buses[i].bus_number) {
+                    if (!found_any) {
+                        printf("\nAssigned Students:");
+                        found_any = 1;
+                    }
+                    // Look up student info
+                    struct student s;
+                    struct pickuprequest req;
+                    // Read request details from approved file
+                    FILE *rf = fopen("approvedrequest.txt", "r");
+                    if (rf != NULL) {
+                        while (fscanf(rf, "%d\n", &req.request_number) == 1) {
+                            fscanf(rf, "%d\n", &req.student_roll_number);
+                            fgets(req.pickup_place, sizeof(req.pickup_place), rf);
+                            fgets(req.dropoff_place, sizeof(req.dropoff_place), rf);
+                            fgets(req.status, sizeof(req.status), rf);
+                            req.pickup_place[strcspn(req.pickup_place, "\n")] = '\0';
+                            req.dropoff_place[strcspn(req.dropoff_place, "\n")] = '\0';
+                            req.status[strcspn(req.status, "\n")] = '\0';
+
+                            if (req.request_number == req_num) {
+                                if (findstudent(req.student_roll_number, &s)) {
+                                    printf("\n  - [%d] %s (Roll: %d) | %s -> %s",
+                                           req.request_number, s.name,
+                                           s.student_roll_no,
+                                           req.pickup_place, req.dropoff_place);
+                                } else {
+                                    printf("\n  - [%d] Roll: %d (student not found) | %s -> %s",
+                                           req.request_number, req.student_roll_number,
+                                           req.pickup_place, req.dropoff_place);
+                                }
+                                break;
+                            }
+                        }
+                        fclose(rf);
+                    }
+                }
+            }
+            fclose(af);
+        }
+
+        int remaining = buses[i].max_capacity - buses[i].current_count;
+        printf("\nRemaining Seats: %d", remaining);
+        printf("\n-----------------------------\n");
+    }
+}
+
+// View capacity summary grouped by route.
+void viewRouteCapacity(void) {
+    struct bus buses[MAX_BUSES];
+    int busCount = loadBuses(buses, MAX_BUSES);
+
+    if (busCount == 0) {
+        printf("\nNo buses registered yet.\n");
+        return;
+    }
+
+    // 4 locations = up to 12 unique directional routes
+    // We'll aggregate by route pair
+    char *loc_names[] = {"JUIT", "Ravli PG", "Peach Tree", "Waknaghat"};
+
+    printf("\n===== ROUTE CAPACITY SUMMARY =====\n");
+
+    // Iterate all possible route pairs
+    for (int p = 0; p < 4; p++) {
+        for (int d = 0; d < 4; d++) {
+            if (p == d) continue;
+
+            int total_capacity = 0;
+            int total_assigned = 0;
+            int bus_count = 0;
+
+            for (int i = 0; i < busCount; i++) {
+                if (buses[i].route_pickup == p && buses[i].route_dropoff == d) {
+                    total_capacity += buses[i].max_capacity;
+                    total_assigned += buses[i].current_count;
+                    bus_count++;
+                }
+            }
+
+            if (bus_count > 0) {
+                printf("\n%s -> %s", loc_names[p], loc_names[d]);
+                printf("\n  Buses: %d", bus_count);
+                printf("\n  Assigned: %d / %d seats", total_assigned, total_capacity);
+                printf("\n  Available: %d seats", total_capacity - total_assigned);
+            }
+        }
+    }
+    printf("\n");
+}
+
+// Remove a specific assignment (unassign a student from a bus).
+void unassignRequest(void) {
+    int req_num;
+    printf("\nUNASSIGN REQUEST FROM BUS\n");
+    printf("Enter request number to unassign: ");
+    req_num = read_int();
+
+    FILE *f = fopen(BUS_ASSIGNMENTS_FILE, "r");
+    if (f == NULL) {
+        printf("\nNo assignments exist.\n");
+        return;
+    }
+
+    // Read all assignments into memory
+    int req_nums[500];
+    int bus_nums[500];
+    int total = 0;
+    int found = 0;
+
+    while (total < 500 && fscanf(f, "%d %d\n", &req_nums[total], &bus_nums[total]) == 2) {
+        if (req_nums[total] == req_num) found = 1;
+        total++;
+    }
+    fclose(f);
+
+    if (!found) {
+        printf("\nRequest %d is not assigned to any bus.\n", req_num);
+        return;
+    }
+
+    // Write back without the matching entry, and decrement bus count
+    FILE *wf = fopen(BUS_ASSIGNMENTS_FILE, "w");
+    struct bus buses[MAX_BUSES];
+    int busCount = loadBuses(buses, MAX_BUSES);
+
+    int written = 0;
+    for (int i = 0; i < total; i++) {
+        if (req_nums[i] == req_num) {
+            // Decrement the bus count
+            for (int b = 0; b < busCount; b++) {
+                if (buses[b].bus_number == bus_nums[i] && buses[b].current_count > 0) {
+                    buses[b].current_count--;
+                    break;
+                }
+            }
+            continue;  // skip writing this entry
+        }
+        fprintf(wf, "%d %d\n", req_nums[i], bus_nums[i]);
+        written++;
+    }
+    fclose(wf);
+
+    saveBuses(buses, busCount);
+    printf("\nRequest %d has been unassigned from its bus.\n", req_num);
+}
+
+// Bus Scheduler Portal
+void busSchedulerPortal(void) {
+    int choice;
+    while (1) {
+        printf("\nBUS SCHEDULER PORTAL");
+        printf("\n1. Register New Bus");
+        printf("\n2. Auto-Assign Approved Requests to Buses");
+        printf("\n3. View Bus Schedule");
+        printf("\n4. View Route Capacity Summary");
+        printf("\n5. Unassign a Request from Bus");
+        printf("\n6. Exit Bus Scheduler Portal");
+        printf("\n\nEnter your choice: ");
+
+        choice = read_int();
+
+        if (choice == 1) {
+            registerBus();
+        }
+        else if (choice == 2) {
+            assignRequests();
+        }
+        else if (choice == 3) {
+            viewBusSchedule();
+        }
+        else if (choice == 4) {
+            viewRouteCapacity();
+        }
+        else if (choice == 5) {
+            unassignRequest();
+        }
+        else if (choice == 6) {
+            printf("\nExiting Bus Scheduler Portal...\n");
+            break;
+        }
+        else {
+            printf("\nInvalid choice. Try again.\n");
+        }
+    }
+}
+
+// ============================================================
+// END BUS SCHEDULING FUNCTIONS
+// ============================================================
+
 void guardportal(void) {
 
     //Guard portal function to read the request from the file and display it to the guard for approval or rejection.
@@ -385,7 +840,7 @@ void guardportal(void) {
         int guard_choice;
         printf("\n1. Approve Request");
         printf("\n2. Reject Request");
-        printf("\n\nEnter your choice: ");
+        printf("\nEnter your choice: ");
         guard_choice = read_int();
 
         if (guard_choice == 1) {
@@ -465,6 +920,18 @@ void viewrequests(char filename[], char title[]){
 
     printf("\n===== %s =====\n", title);
 
+    // Load bus assignments for display
+    FILE *bf = fopen(BUS_ASSIGNMENTS_FILE, "r");
+    int assign_reqs[500], assign_buses[500];
+    int assign_count = 0;
+    if (bf != NULL) {
+        while (assign_count < 500 &&
+               fscanf(bf, "%d %d\n", &assign_reqs[assign_count], &assign_buses[assign_count]) == 2) {
+            assign_count++;
+        }
+        fclose(bf);
+    }
+
     while (fscanf(file, "%d\n", &request.request_number) == 1)
     {
         fscanf(file, "%d\n", &request.student_roll_number);
@@ -494,6 +961,15 @@ void viewrequests(char filename[], char title[]){
         printf("\nPickup Place: %s", request.pickup_place);
         printf("\nDropoff Place: %s", request.dropoff_place);
         printf("\nStatus: %s", request.status);
+
+        // Show bus assignment if applicable
+        for (int a = 0; a < assign_count; a++) {
+            if (assign_reqs[a] == request.request_number) {
+                printf("\nBus Number: %d", assign_buses[a]);
+                break;
+            }
+        }
+
         printf("\n-----------------------------\n");
     }
 
@@ -563,8 +1039,22 @@ void studentrequeststatus(void){
                 printf("\nRequest Number: %d", request.request_number);
                 printf("\nPickup: %s", request.pickup_place);
                 printf("\nDropoff: %s", request.dropoff_place);
-                printf("\nStatus: %s\n", request.status);
+                printf("\nStatus: %s", request.status);
 
+                // Show bus assignment
+                FILE *bf = fopen(BUS_ASSIGNMENTS_FILE, "r");
+                if (bf != NULL) {
+                    int rn, bn;
+                    while (fscanf(bf, "%d %d\n", &rn, &bn) == 2) {
+                        if (rn == request.request_number) {
+                            printf("\nBus Number: %d", bn);
+                            break;
+                        }
+                    }
+                    fclose(bf);
+                }
+
+                printf("\n");
                 found = 1;
             }
         }
@@ -621,7 +1111,7 @@ void studentportal(void){
         printf("\n2. Create Pickup Request");
         printf("\n3. Check Request Status");
         printf("\n4. Exit Student Portal");
-        printf("\n\nEnter your choice: ");
+        printf("\nEnter your choice: ");
         choice = read_int();
         if (choice == 1){
             studentregistration(&current_student);
@@ -652,7 +1142,7 @@ void guardmenu(void){
         printf("\n2. View Approved Requests");
         printf("\n3. View Rejected Requests");
         printf("\n4. Exit Guard Portal");
-        printf("\n\nEnter your choice: ");
+        printf("\nEnter your choice: ");
 
         choice = read_int();
 
@@ -676,26 +1166,34 @@ void guardmenu(void){
 }
 
 int main() {
-    //Student and Guard Main portal
     int choice;
-    printf("JUIT SMART SHUTTLE\n");
-    printf("\n1. Student Portal");
-    printf("\n2. Guard Portal");        
-    printf("\n3. Exit");
-    printf("\n\nEnter your choice: ");
-    choice = read_int();
+    while (1) {
+        printf("\n========================================");
+        printf("\n       JUIT SMART SHUTTLE");
+        printf("\n========================================");
+        printf("\n1. Student Portal");
+        printf("\n2. Guard Portal");
+        printf("\n3. Bus Scheduler Portal");
+        printf("\n4. Exit");
+        printf("\nEnter your choice: ");
+        choice = read_int();
 
-    if (choice == 1) {
-        studentportal();
-    }
-    else if (choice == 2) {
-        guardmenu();
-    }
-    else if (choice == 3) {
-        printf("\nExiting JUIT Smart Shuttle\n");
-    }
-    else {
-        printf("\nInvalid choice.\n");
+        if (choice == 1) {
+            studentportal();
+        }
+        else if (choice == 2) {
+            guardmenu();
+        }
+        else if (choice == 3) {
+            busSchedulerPortal();
+        }
+        else if (choice == 4) {
+            printf("\nExiting JUIT Smart Shuttle\n");
+            break;
+        }
+        else {
+            printf("\nInvalid choice.\n");
+        }
     }
 
     return 0;
