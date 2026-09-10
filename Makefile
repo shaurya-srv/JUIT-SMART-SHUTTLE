@@ -41,6 +41,48 @@ $(OBJDIR)/src/core/service.o: src/core/service.h src/core/models.h src/db/databa
 $(OBJDIR)/src/db/database.o: src/db/database.h src/core/models.h
 
 clean:
-	rm -rf $(OBJDIR) $(TARGET).exe
+	rm -rf $(OBJDIR) $(TARGET).exe $(API_TARGET).exe
 
-.PHONY: all clean
+# ------------------------------------------------------------
+# HTTP/JSON API server (winsock2, reuses core/ + db/)
+# ------------------------------------------------------------
+API_TARGET = shuttle_api
+API_SRCS = src/api/server.c src/api/handlers.c src/api/json.c \
+           src/core/service.c \
+           src/db/database.c
+API_OBJS = $(patsubst %.c,$(OBJDIR)/%.o,$(API_SRCS))
+
+api: $(API_TARGET)
+
+$(API_TARGET): $(API_OBJS)
+	$(CC) $(API_OBJS) -o $(API_TARGET).exe $(LDFLAGS) -lws2_32
+
+$(OBJDIR)/src/api/server.o: src/api/server.c src/api/handlers.h src/db/database.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJDIR)/src/api/handlers.o: src/api/handlers.c src/api/handlers.h src/api/json.h src/db/database.h src/core/models.h src/core/service.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJDIR)/src/api/json.o: src/api/json.c src/api/json.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+.PHONY: all clean test api
+
+# ------------------------------------------------------------
+# Unit tests: core assignment algorithm against an in-memory db stub.
+# No MySQL server or library needed.
+# ------------------------------------------------------------
+TESTBIN = $(OBJDIR)/test_service.exe
+
+test: $(TESTBIN)
+	./$(TESTBIN)
+
+$(TESTBIN): tests/test_service.c tests/stub_db.c tests/stub_db.h \
+            src/core/service.c src/core/service.h src/core/models.h
+	@mkdir -p $(OBJDIR)
+	$(CC) $(CFLAGS) -Itests $^ -o $@
+
+.PHONY: all clean test

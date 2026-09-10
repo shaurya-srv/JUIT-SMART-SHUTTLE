@@ -65,4 +65,18 @@ typedef struct {
     char dropoff_place[31];
 } request_summary_t;
 
+// Full request row joined with student info (list views, API responses).
+typedef struct {
+    int  request_number;
+    char student_name[35];
+    int  student_roll_number;
+    char hostel_name[30];
+    char room_number[60];
+    char phone_number[15];
+    char pickup_place[31];
+    char dropoff_place[31];
+    char status[35];
+    int  bus_number;   // 0 = not assigned to a bus
+} request_row_t;
+
 #endif // CORE_MODELS_H

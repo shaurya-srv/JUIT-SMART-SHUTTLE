@@ -26,8 +26,8 @@ int core_route_is_valid(int pickup_location, int dropoff_location);
 // Request lifecycle transitions
 // ------------------------------------------------------------
 
-// Approve a request: validates current status, updates the DB.
-// Returns 1 on success, 0 on failure (reason printed by caller on request).
+// Approve a request: only PENDING_APPROVAL requests may transition.
+// Returns 1 on success, 0 on failure (not found, not pending, or db error).
 int core_approve_request(int request_number);
 
 // Reject a request. Same contract as core_approve_request.

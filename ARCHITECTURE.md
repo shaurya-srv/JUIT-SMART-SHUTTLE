@@ -88,17 +88,45 @@ shuttle/
    Build verified: `mingw32-make` clean with -Wall -Wextra; smoke run connects and
    migrates against the live DB.
 
-### Phase 2 — Split CLI
-1. Split `index.c` into `cli/student.c`, `cli/guard.c`, `cli/scheduler.c` + `main.c`.
-2. `db/` moves to `src/db/` unchanged.
+### Phase 2 — Split CLI — DONE (2026-09-10, commit e2cee0f)
+1. DONE: Split `index.c` into `cli/student.c`, `cli/guard.c`, `cli/scheduler.c` + `main.c`.
+2. DONE: `db/` moves to `src/db/`; added `db_get_pending_request_summaries()` so the CLI no longer touches SQL directly.
+3. DONE: Makefile rewritten for the `src/` layout (build dir, header deps); verified with a clean build and a smoke run against the live DB. CLI code no longer includes mysql.h.
 
-### Phase 3 — HTTP/JSON API (new)
-1. `api/server.c`: winsock2 listener on `127.0.0.1:8080`, one thread per connection,
-   routes:
-   | Method | Path | Purpose |
-   |---|---|---|
-   | POST | /api/login | student/guard/scheduler auth |
-   | POST | /api/requests | create pickup request |
+### Phase 3 — HTTP/JSON API — **ENDPOINTS COMPLETE 2026-09-10**
+1. ✅ `src/api/server.c`: winsock2 listener on `127.0.0.1:8080` (loopback only),
+   one thread per connection, all handlers serialized under a CRITICAL_SECTION
+   (the DAL's single MYSQL* is not thread-safe — pool is the Phase 4 upgrade).
+   Built as `shuttle_api.exe` via `make api`. Live-tested with curl:
+   health, login (all three roles, plus bad-credential/method/role paths),
+   request creation (real DB write, token auth, role enforcement, route
+   validation), 404.
+   Routes implemented so far:
+   | Method | Path | Purpose | Status |
+   |---|---|---|---|
+   | GET/POST | /api/health | liveness + DB ping | ✅ done |
+   | POST | /api/login | student/guard/scheduler auth, returns session token | ✅ done |
+   | POST | /api/requests | create pickup request (Bearer token, student role) | ✅ done |
+   | GET | /api/requests?status= | list by status (guard/scheduler) | ✅ done |
+   | GET | /api/requests/mine | student's own requests | ✅ done |
+   | POST | /api/requests/{id}/approve · /reject | guard actions, 409 if not pending | ✅ done |
+   | GET/POST | /api/buses | list / register buses (scheduler) | ✅ done |
+   | POST | /api/buses/assign | run assignment algorithm (scheduler) | ✅ done |
+   | POST | /api/assignments/unassign | remove assignment (scheduler) | ✅ done |
+   | GET | /api/reports/capacity | route capacity summary (scheduler/guard) | ✅ done |
+
+   All endpoints live-tested with curl (21 checks): auth + role enforcement on
+   every route, real DB writes (request created, approved, assigned to bus 1
+   on exact route match, capacity reported, unassign rejected when not
+   assigned), 409 conflict on re-approve, 404 on unknown request.
+   Supporting DAL additions: `request_row_t`, `db_get_request_rows_by_status()`,
+   `db_get_request_rows_by_student()`, `db_get_request_status()`.
+   Lifecycle hardened: `core_approve/reject_request()` now refuse non-pending
+   requests (was a bare status overwrite).
+2. ✅ `src/api/json.{h,c}`: minimal flat-object parser (string/int) and escaper,
+   no external deps.
+3. ✅ Scaffold auth: password check via db, in-memory session table (rand-based
+   tokens — replace with CSPRNG + expiry in Phase 4).
    | GET | /api/requests?status= | list by status (guard/scheduler) |
    | GET | /api/requests/mine | student's own requests |
    | POST | /api/requests/{id}/approve · /reject | guard actions |
@@ -109,14 +137,24 @@ shuttle/
 2. `api/json.c`: minimal encode/decode (no external deps).
 3. Auth: password check via `core/`, session token in memory; plaintext passwords
    must be hashed before this ships (see §6).
-4. `index.html` rewritten: same UI, `fetch()` calls replace the localStorage layer.
+4. ✅ `index.html` rewritten: same UI, `fetch()` calls to `shuttle_api` replace the
+   localStorage layer (only the session token persists locally). All portals —
+   student, guard, scheduler — now read/write real MySQL data. Server gained
+   CORS (preflight + headers) and Content-Length-aware body reads for browser
+   clients; new public `POST /api/register` mirrors CLI registration.
 
 ### Phase 4 — Hardening
 1. Transactions: assignment capacity check + insert atomic; stop `MAX(request_number)+1`
    (use the existing `AUTO_INCREMENT id`).
 2. Password hashing (salted) for students + role credentials.
 3. SQL string escaping audit across `db/` (the deferred fix).
-4. Unit tests for `core/` (assignment edges: full buses, mixed routes, unassign/refill).
+4. Unit tests for `core/` — **assignment algorithm done 2026-09-10** (`make test`):
+   `tests/test_service.c` runs `core_assign_approved_requests()` against an
+   in-memory db stub (`tests/stub_db.c`), no MySQL needed. Covers: full-bus
+   skipping, exact-route matching, first-match ordering, reverse-direction
+   requests, 80% warning firing once per bus, already-assigned skipping,
+   db-failure resilience, empty inputs, NULL-result tolerance.
+   Still to do: lifecycle-transition tests.
 
 ## 5. Decisions log
 

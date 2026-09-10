@@ -268,38 +268,51 @@
 
 <script>
 // ============================================================
-// DATA LAYER (localStorage)
+// API CLIENT (shuttle_api on 127.0.0.1:8080)
 // ============================================================
-const DB = {
-  get(k, d) { try { return JSON.parse(localStorage.getItem('jss_'+k)) || d; } catch { return d; } },
-  set(k, v)  { localStorage.setItem('jss_'+k, JSON.stringify(v)); },
-};
+const API = 'http://127.0.0.1:8080';
 
-// Seed default credentials if first run
-if (!DB.get('cred_init')) {
-  DB.set('credentials', { guard: 'guard123', scheduler: 'scheduler123' });
-  DB.set('students', []);
-  DB.set('requests', []);
-  DB.set('buses', []);
-  DB.set('assignments', []);
-  DB.set('cred_init', true);
+// Wraps fetch with timeout + JSON handling; throws Error(message) on
+// non-2xx using the API's {"error":"..."} body.
+async function apiCall(method, path, body, auth = false) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetch(API + path, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(auth && window.API_TOKEN ? { 'Authorization': 'Bearer ' + window.API_TOKEN } : {})
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: ctrl.signal
+    });
+    const text = await res.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch { data = {}; }
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    return data;
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Request timed out. Is shuttle_api.exe running?');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-// Helpers
-let nextId = (key) => {
-  const ids = DB.get(key, []).map(x => x.id);
-  return ids.length ? Math.max(...ids) + 1 : 1;
-};
 const LOCATIONS = ['JUIT', 'Ravli PG', 'Peach Tree', 'Waknaghat'];
 const locName = (i) => LOCATIONS[i] || 'Unknown';
 const locIndex = (s) => LOCATIONS.indexOf(s);
-const routeName = (p, d) => `${locName(p)} → ${locName(d)}`;
+const routeName = (p, d) => `${p} → ${d}`;
 
-// Current session
-let session = DB.get('session', null);
+// Session survives reload via localStorage (token only — server holds the state).
+let session = JSON.parse(localStorage.getItem('jss_session') || 'null');
+function saveSession() { localStorage.setItem('jss_session', JSON.stringify(session)); window.API_TOKEN = session ? session.token : null; }
+function clearSession() { localStorage.removeItem('jss_session'); session = null; window.API_TOKEN = null; }
+window.API_TOKEN = session ? session.token : null;
 
-function saveSession() { DB.set('session', session); }
-function clearSession() { session = null; DB.set('session', null); }
+const badge = (status) =>
+  `<span class="badge badge-${status === 'APPROVED' ? 'approved' : status === 'REJECTED' ? 'rejected' : 'pending'}">${status.replace('_',' ')}</span>`;
 
 // ============================================================
 // RENDERING
@@ -344,29 +357,29 @@ function togglePass() {
   p.type = p.type === 'password' ? 'text' : 'password';
 }
 
-function doLogin() {
+async function doLogin() {
   const role = document.getElementById('role').value;
   const pass = document.getElementById('pass').value;
   if (!pass) return showAlert('alert', 'Please enter a password.', 'error');
 
+  const payload = { role, password: pass };
   if (role === 'student') {
     const roll = parseInt(document.getElementById('roll').value);
     if (!roll) return showAlert('alert', 'Please enter your roll number.', 'error');
-    const students = DB.get('students', []);
-    const s = students.find(x => x.roll === roll);
-    if (!s) return showAlert('alert', 'Student not found. Please register first.', 'error');
-    if (s.password !== pass) return showAlert('alert', 'Incorrect password.', 'error');
-    session = { role: 'student', roll: roll, name: s.name };
+    payload.roll_number = roll;
+  }
+
+  try {
+    const data = await apiCall('POST', '/api/login', payload);
+    session = data.role === 'student'
+      ? { role: 'student', token: data.token, roll: data.roll_number, name: data.name }
+      : { role: data.role, token: data.token };
     saveSession();
-    showStudentPortal();
-  } else {
-    const creds = DB.get('credentials', {});
-    const key = role === 'guard' ? 'guard' : 'scheduler';
-    if (creds[key] !== pass) return showAlert('alert', 'Incorrect password.', 'error');
-    session = { role };
-    saveSession();
-    if (role === 'guard') showGuardPortal();
+    if (session.role === 'student') showStudentPortal();
+    else if (session.role === 'guard') showGuardPortal();
     else showBusSchedulerPortal();
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
   }
 }
 
@@ -406,7 +419,7 @@ function showRegister() {
   `);
 }
 
-function doRegister() {
+async function doRegister() {
   const roll = parseInt(document.getElementById('reg_roll').value);
   const name = document.getElementById('reg_name').value.trim();
   const room = document.getElementById('reg_room').value.trim();
@@ -419,23 +432,23 @@ function doRegister() {
   if (pass.length < 4)
     return showAlert('alert', 'Password must be at least 4 characters.', 'error');
 
-  const students = DB.get('students', []);
-  if (students.find(s => s.roll === roll))
-    return showAlert('alert', 'A student with this roll number already exists.', 'error');
-
-  students.push({ roll, name, room, hostel, phone, password: pass });
-  DB.set('students', students);
-  showAlert('alert', 'Registration successful! You can now login.', 'success');
-  setTimeout(showLogin, 1500);
+  try {
+    await apiCall('POST', '/api/register', {
+      roll_number: roll, name, room, hostel, phone, password: pass
+    });
+    showAlert('alert', 'Registration successful! You can now login.', 'success');
+    setTimeout(showLogin, 1500);
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
+  }
 }
 
 // ---------- STUDENT PORTAL ----------
 function showStudentPortal() {
-  const s = DB.get('students', []).find(x => x.roll === session.roll);
   render(`
     <div class="welcome-bar">
-      <span>Welcome, <strong>${s.name}</strong></span>
-      <span class="text-muted">Roll: ${s.roll}</span>
+      <span>Welcome, <strong>${session.name}</strong></span>
+      <span class="text-muted">Roll: ${session.roll}</span>
     </div>
     <div class="card">
       <h2><span class="icon">🎓</span> Student Portal</h2>
@@ -468,50 +481,45 @@ function showCreateRequest() {
   `);
 }
 
-function submitRequest() {
-  const pickup = parseInt(document.getElementById('req_pickup').value);
-  const dropoff = parseInt(document.getElementById('req_dropoff').value);
+async function submitRequest() {
+  const pickup = locName(parseInt(document.getElementById('req_pickup').value));
+  const dropoff = locName(parseInt(document.getElementById('req_dropoff').value));
   if (pickup === dropoff) return showAlert('alert', 'Pickup and dropoff must be different.', 'error');
 
-  const requests = DB.get('requests', []);
-  requests.push({
-    id: nextId('requests'),
-    studentRoll: session.roll,
-    pickup, dropoff,
-    pickupName: locName(pickup),
-    dropoffName: locName(dropoff),
-    status: 'PENDING_APPROVAL',
-    busNumber: null,
-    createdAt: Date.now()
-  });
-  DB.set('requests', requests);
-  showAlert('alert', 'Request submitted successfully!', 'success');
-  setTimeout(showStudentPortal, 1200);
+  try {
+    const data = await apiCall('POST', '/api/requests', { pickup_place: pickup, dropoff_place: dropoff }, true);
+    showAlert('alert', `Request #${data.request_number} submitted successfully!`, 'success');
+    setTimeout(showStudentPortal, 1200);
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
+  }
 }
 
-function showStudentStatus() {
-  const requests = DB.get('requests', []).filter(r => r.studentRoll === session.roll);
-  const buses = DB.get('buses', []);
-  const assigns = DB.get('assignments', []);
-
+async function showStudentStatus() {
+  render(`<a class="back-link" onclick="showStudentPortal()">← Back</a><div class="card"><h2><span class="icon">📋</span> My Requests</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let rows;
+  try {
+    rows = (await apiCall('GET', '/api/requests/mine', undefined, true)).requests;
+  } catch (e) {
+    return render(`<a class="back-link" onclick="showStudentPortal()">← Back</a><div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
   let html = `
     <a class="back-link" onclick="showStudentPortal()">← Back</a>
     <div class="card">
       <h2><span class="icon">📋</span> My Requests</h2>
   `;
-  if (!requests.length) {
+  if (!rows.length) {
     html += `<div class="empty-state"><div class="icon">📭</div><p>No requests yet.</p></div>`;
   } else {
-    requests.slice().reverse().forEach(r => {
-      const busInfo = assigns.find(a => a.requestId === r.id);
-      const busLabel = busInfo ? `Bus #${busInfo.busNumber}` : 'Not assigned';
+    rows.forEach(r => {
+      const busLabel = r.bus ? `Bus #${r.bus}` : 'Not assigned';
       html += `
         <div class="list-item">
           <div class="row">
-            <span class="label">Request #${r.id}</span>
-            <span class="badge badge-${r.status === 'APPROVED' ? 'approved' : r.status === 'REJECTED' ? 'rejected' : 'pending'}">${r.status.replace('_',' ')}</span>
+            <span class="label">Request #${r.request_number}</span>
+            ${badge(r.status)}
           </div>
-          <div class="value">${r.pickupName} → ${r.dropoffName}</div>
+          <div class="value">${r.pickup} → ${r.dropoff}</div>
           <div class="text-muted" style="margin-top:4px">🚌 ${busLabel}</div>
         </div>`;
     });
@@ -521,17 +529,20 @@ function showStudentStatus() {
 }
 
 // ---------- GUARD PORTAL ----------
-function showGuardPortal() {
-  const pending = DB.get('requests', []).filter(r => r.status === 'PENDING_APPROVAL');
+async function showGuardPortal() {
+  let pendingCount = '?';
+  try {
+    pendingCount = (await apiCall('GET', '/api/requests?status=PENDING_APPROVAL', undefined, true)).count;
+  } catch (e) { /* show dashboards regardless */ }
   render(`
     <div class="welcome-bar">
       <span>🧑‍✈️ <strong>Guard Portal</strong></span>
-      <span class="badge badge-pending">${pending.length} pending</span>
+      <span class="badge badge-pending">${pendingCount} pending</span>
     </div>
     <div class="card">
       <h2><span class="icon">🛡️</span> Guard Dashboard</h2>
       <div class="menu-grid">
-        <div class="menu-btn" onclick="showPendingRequests()"><span class="menu-icon">📥</span>Process Requests <br><small class="text-muted">${pending.length} pending</small></div>
+        <div class="menu-btn" onclick="showPendingRequests()"><span class="menu-icon">📥</span>Process Requests <br><small class="text-muted">${pendingCount} pending</small></div>
         <div class="menu-btn" onclick="showApprovedList()"><span class="menu-icon">✅</span>Approved</div>
         <div class="menu-btn" onclick="showRejectedList()"><span class="menu-icon">❌</span>Rejected</div>
       </div>
@@ -541,33 +552,35 @@ function showGuardPortal() {
   `);
 }
 
-function showPendingRequests() {
-  const requests = DB.get('requests', []);
-  const pending = requests.filter(r => r.status === 'PENDING_APPROVAL');
-  const students = DB.get('students', []);
-
+async function showPendingRequests() {
+  render(`<a class="back-link" onclick="showGuardPortal()">← Back</a><div class="card"><h2><span class="icon">📥</span> Pending Requests</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let rows;
+  try {
+    rows = (await apiCall('GET', '/api/requests?status=PENDING_APPROVAL', undefined, true)).requests;
+  } catch (e) {
+    return render(`<a class="back-link" onclick="showGuardPortal()">← Back</a><div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
   let html = `
     <a class="back-link" onclick="showGuardPortal()">← Back</a>
     <div class="card">
-      <h2><span class="icon">📥</span> Pending Requests (${pending.length})</h2>
+      <h2><span class="icon">📥</span> Pending Requests (${rows.length})</h2>
   `;
-  if (!pending.length) {
+  if (!rows.length) {
     html += `<div class="empty-state"><div class="icon">✅</div><p>No pending requests.</p></div>`;
   }
-  pending.forEach(r => {
-    const s = students.find(x => x.roll === r.studentRoll);
+  rows.forEach(r => {
     html += `
       <div class="list-item">
         <div class="row">
-          <span class="label">Request #${r.id}</span>
+          <span class="label">Request #${r.request_number}</span>
           <span class="badge badge-pending">PENDING</span>
         </div>
-        <div class="value">${s ? s.name : 'Unknown'} (Roll: ${r.studentRoll})</div>
-        <div class="text-muted">${s ? `${s.hostel} · Room ${s.room} · ${s.phone}` : ''}</div>
-        <div style="margin-top:6px;font-weight:600">${r.pickupName} → ${r.dropoffName}</div>
+        <div class="value">${r.student_name} (Roll: ${r.roll_number})</div>
+        <div class="text-muted">${r.hostel} · Room ${r.room} · ${r.phone}</div>
+        <div style="margin-top:6px;font-weight:600">${r.pickup} → ${r.dropoff}</div>
         <div class="btn-group">
-          <button class="btn btn-success btn-sm" onclick="decideRequest(${r.id},'APPROVED')">✅ Approve</button>
-          <button class="btn btn-danger btn-sm" onclick="decideRequest(${r.id},'REJECTED')">❌ Reject</button>
+          <button class="btn btn-success btn-sm" onclick="decideRequest(${r.request_number},'approve')">✅ Approve</button>
+          <button class="btn btn-danger btn-sm" onclick="decideRequest(${r.request_number},'reject')">❌ Reject</button>
         </div>
       </div>`;
   });
@@ -575,41 +588,45 @@ function showPendingRequests() {
   render(html);
 }
 
-function decideRequest(id, status) {
-  const requests = DB.get('requests', []);
-  const r = requests.find(x => x.id === id);
-  if (r) { r.status = status; DB.set('requests', requests); }
-  showPendingRequests();
+async function decideRequest(id, action) {
+  try {
+    const data = await apiCall('POST', `/api/requests/${id}/${action}`, {}, true);
+    showPendingRequests();
+  } catch (e) {
+    alert(e.message);
+    showPendingRequests();
+  }
 }
 
 function showApprovedList() { showRequestList('APPROVED', '✅ Approved Requests'); }
 function showRejectedList() { showRequestList('REJECTED', '❌ Rejected Requests'); }
 
-function showRequestList(status, title) {
-  const requests = DB.get('requests', []).filter(r => r.status === status);
-  const students = DB.get('students', []);
-  const assigns = DB.get('assignments', []);
-
+async function showRequestList(status, title) {
+  render(`<a class="back-link" onclick="showGuardPortal()">← Back</a><div class="card"><h2>${title}</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let rows;
+  try {
+    rows = (await apiCall('GET', '/api/requests?status=' + status, undefined, true)).requests;
+  } catch (e) {
+    return render(`<a class="back-link" onclick="showGuardPortal()">← Back</a><div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
   let html = `
     <a class="back-link" onclick="showGuardPortal()">← Back</a>
     <div class="card">
-      <h2>${title} (${requests.length})</h2>
+      <h2>${title} (${rows.length})</h2>
   `;
-  if (!requests.length) {
+  if (!rows.length) {
     html += `<div class="empty-state"><div class="icon">📭</div><p>No ${status.toLowerCase()} requests.</p></div>`;
   }
-  requests.forEach(r => {
-    const s = students.find(x => x.roll === r.studentRoll);
-    const busInfo = assigns.find(a => a.requestId === r.id);
+  rows.forEach(r => {
     html += `
       <div class="list-item">
         <div class="row">
-          <span class="label">Request #${r.id}</span>
+          <span class="label">Request #${r.request_number}</span>
           <span class="badge badge-${status === 'APPROVED' ? 'approved' : 'rejected'}">${status}</span>
         </div>
-        <div class="value">${s ? s.name : 'Unknown'} (Roll: ${r.studentRoll})</div>
-        <div>${r.pickupName} → ${r.dropoffName}</div>
-        ${busInfo ? `<div class="text-muted">🚌 Bus #${busInfo.busNumber}</div>` : ''}
+        <div class="value">${r.student_name} (Roll: ${r.roll_number})</div>
+        <div>${r.pickup} → ${r.dropoff}</div>
+        ${r.bus ? `<div class="text-muted">🚌 Bus #${r.bus}</div>` : ''}
       </div>`;
   });
   html += '</div>';
@@ -657,60 +674,44 @@ function showRegisterBus() {
   `);
 }
 
-function registerBus() {
+async function registerBus() {
   const pickup = parseInt(document.getElementById('bus_pickup').value);
   const dropoff = parseInt(document.getElementById('bus_dropoff').value);
   const cap = parseInt(document.getElementById('bus_cap').value);
   if (pickup === dropoff) return showAlert('alert', 'Pickup and dropoff must differ.', 'error');
   if (cap < 1 || cap > 30) return showAlert('alert', 'Capacity must be 1–30.', 'error');
 
-  const buses = DB.get('buses', []);
-  const id = buses.length ? Math.max(...buses.map(b => b.id)) + 1 : 1;
-  buses.push({ id, pickup, dropoff, count: 0, maxCapacity: cap });
-  DB.set('buses', buses);
-  showAlert('alert', `Bus #${id} registered: ${routeName(pickup, dropoff)} (cap: ${cap})`, 'success');
-  setTimeout(showBusSchedulerPortal, 1200);
+  try {
+    const data = await apiCall('POST', '/api/buses',
+      { route_pickup: pickup, route_dropoff: dropoff, max_capacity: cap }, true);
+    showAlert('alert', `Bus #${data.bus_number} registered: ${locName(pickup)} → ${locName(dropoff)} (cap: ${cap})`, 'success');
+    setTimeout(showBusSchedulerPortal, 1200);
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
+  }
 }
 
-function doAutoAssign() {
-  const buses = DB.get('buses', []);
-  const requests = DB.get('requests', []);
-  const assignments = DB.get('assignments', []);
-  const approved = requests.filter(r => r.status === 'APPROVED' && !assignments.find(a => a.requestId === r.id));
-
-  if (!buses.length) return alert('No buses registered. Register buses first.');
-  if (!approved.length) return alert('No unassigned approved requests.');
-
-  let count = 0;
-  const warns = new Set();
-
-  approved.forEach(r => {
-    const bus = buses.find(b => b.pickup === r.pickup && b.dropoff === r.dropoff && b.count < b.maxCapacity);
-    if (bus) {
-      bus.count++;
-      assignments.push({ requestId: r.id, busNumber: bus.id });
-      r.busNumber = bus.id;
-      if (bus.count / bus.maxCapacity >= 0.8) warns.add(bus.id);
-    }
-  });
-
-  DB.set('buses', buses);
-  DB.set('assignments', assignments);
-  DB.set('requests', requests);
-  count = assignments.length - (assignments.length - approved.filter(r => r.busNumber).length);
-
-  let msg = `${approved.filter(r => r.busNumber).length} request(s) assigned.`;
-  if (warns.size) msg += ` ⚠️ ${warns.size} bus(es) at 80%+ capacity!`;
-  alert(msg);
-  showBusSchedulerPortal();
+async function doAutoAssign() {
+  try {
+    const r = await apiCall('POST', '/api/buses/assign', {}, true);
+    let msg = `${r.assigned} request(s) assigned.`;
+    if (r.no_bus_available) msg += ` ${r.no_bus_available} could not be placed (no matching bus or all full).`;
+    if (r.warned_buses && r.warned_buses.length) msg += ` ⚠️ Buses at 80%+ capacity: ${r.warned_buses.map(b => '#' + b).join(', ')}`;
+    alert(msg);
+    showBusSchedulerPortal();
+  } catch (e) {
+    alert(e.message);
+  }
 }
 
-function showBusSchedule() {
-  const buses = DB.get('buses', []);
-  const assignments = DB.get('assignments', []);
-  const requests = DB.get('requests', []);
-  const students = DB.get('students', []);
-
+async function showBusSchedule() {
+  render(`<a class="back-link" onclick="showBusSchedulerPortal()">← Back</a><div class="card"><h2><span class="icon">📊</span> Bus Schedule</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let buses;
+  try {
+    buses = (await apiCall('GET', '/api/buses', undefined, true)).buses;
+  } catch (e) {
+    return render(`<a class="back-link" onclick="showBusSchedulerPortal()">← Back</a><div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
   let html = `
     <a class="back-link" onclick="showBusSchedulerPortal()">← Back</a>
     <div class="card">
@@ -720,61 +721,50 @@ function showBusSchedule() {
     html += `<div class="empty-state"><div class="icon">🚌</div><p>No buses registered.</p></div>`;
   }
   buses.forEach(bus => {
-    const pct = Math.round((bus.count / bus.maxCapacity) * 100);
+    const pct = bus.capacity ? Math.round((bus.assigned / bus.capacity) * 100) : 0;
     const color = pct >= 80 ? 'var(--danger)' : pct >= 50 ? 'var(--warn)' : 'var(--accent)';
-    const busAssignments = assignments.filter(a => a.busNumber === bus.id);
 
     html += `
       <div class="list-item">
         <div class="row">
-          <span style="font-weight:700">🚌 Bus #${bus.id}</span>
+          <span style="font-weight:700">🚌 Bus #${bus.bus_number}</span>
           ${pct >= 100 ? '<span class="badge badge-full">FULL</span>' : pct >= 80 ? '<span class="badge badge-warn">80%+</span>' : ''}
         </div>
-        <div class="value">${routeName(bus.pickup, bus.dropoff)}</div>
+        <div class="value">${bus.route}</div>
         <div class="capacity-bar"><div class="capacity-fill" style="width:${pct}%;background:${color}"></div></div>
-        <div class="text-muted">${bus.count} / ${bus.maxCapacity} seats (${bus.maxCapacity - bus.count} available)</div>
-    `;
-    if (busAssignments.length) {
-      html += `<div style="margin-top:6px;font-size:.78rem;color:var(--text-light)">Assigned:</div>`;
-      busAssignments.forEach(a => {
-        const r = requests.find(x => x.id === a.requestId);
-        const s = r ? students.find(x => x.roll === r.studentRoll) : null;
-        html += `<div style="font-size:.8rem;padding:2px 0">• ${s ? s.name : 'Unknown'} — ${r ? r.pickupName + '→' + r.dropoffName : ''}</div>`;
-      });
-    }
-    html += '</div>';
+        <div class="text-muted">${bus.assigned} / ${bus.capacity} seats (${bus.capacity - bus.assigned} available)</div>
+      </div>`;
   });
   html += '</div>';
   render(html);
 }
 
-function showRouteCapacity() {
-  const buses = DB.get('buses', []);
+async function showRouteCapacity() {
+  render(`<a class="back-link" onclick="showBusSchedulerPortal()">← Back</a><div class="card"><h2><span class="icon">🗺️</span> Route Capacity</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let routes;
+  try {
+    routes = (await apiCall('GET', '/api/reports/capacity', undefined, true)).routes;
+  } catch (e) {
+    return render(`<a class="back-link" onclick="showBusSchedulerPortal()">← Back</a><div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
   let html = `
     <a class="back-link" onclick="showBusSchedulerPortal()">← Back</a>
     <div class="card">
       <h2><span class="icon">🗺️</span> Route Capacity</h2>
   `;
-  if (!buses.length) {
+  if (!routes.length) {
     html += `<div class="empty-state"><div class="icon">🗺️</div><p>No buses registered.</p></div>`;
   } else {
     html += '<table><tr><th>Route</th><th>Buses</th><th>Assigned</th><th>Capacity</th><th>Available</th></tr>';
-    for (let p = 0; p < 4; p++) {
-      for (let d = 0; d < 4; d++) {
-        if (p === d) continue;
-        const routeBuses = buses.filter(b => b.pickup === p && b.dropoff === d);
-        if (!routeBuses.length) continue;
-        const totalCap = routeBuses.reduce((s, b) => s + b.maxCapacity, 0);
-        const totalAssigned = routeBuses.reduce((s, b) => s + b.count, 0);
-        html += `<tr>
-          <td style="font-weight:600">${locName(p)} → ${locName(d)}</td>
-          <td>${routeBuses.length}</td>
-          <td>${totalAssigned}</td>
-          <td>${totalCap}</td>
-          <td style="color:${totalCap - totalAssigned === 0 ? 'var(--danger)' : 'var(--accent)'};font-weight:600">${totalCap - totalAssigned}</td>
-        </tr>`;
-      }
-    }
+    routes.forEach(r => {
+      html += `<tr>
+        <td style="font-weight:600">${r.route}</td>
+        <td>${r.buses}</td>
+        <td>${r.assigned}</td>
+        <td>${r.capacity}</td>
+        <td style="color:${r.available === 0 ? 'var(--danger)' : 'var(--accent)'};font-weight:600">${r.available}</td>
+      </tr>`;
+    });
     html += '</table>';
   }
   html += '</div>';
@@ -788,10 +778,16 @@ function doLogout() {
 }
 
 // ---------- INIT ----------
+// If a saved session exists, verify it is still valid before restoring.
 if (session) {
-  if (session.role === 'student') showStudentPortal();
-  else if (session.role === 'guard') showGuardPortal();
-  else showBusSchedulerPortal();
+  apiCall('GET', '/api/requests/mine', undefined, true)
+    .then(() => { if (session.role === 'student') showStudentPortal(); else showLogin(); })
+    .catch(() => {
+      // Token may still be valid for non-student roles (mine is student-only).
+      apiCall('GET', '/api/requests', undefined, true)
+        .then(() => { if (session.role === 'guard') showGuardPortal(); else showBusSchedulerPortal(); })
+        .catch(() => { clearSession(); showLogin(); });
+    });
 } else {
   showLogin();
 }

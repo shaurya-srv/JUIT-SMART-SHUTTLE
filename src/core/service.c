@@ -39,10 +39,16 @@ int core_route_is_valid(int pickup_location, int dropoff_location) {
 // ------------------------------------------------------------
 
 int core_approve_request(int request_number) {
+    char status[35];
+    if (!db_get_request_status(request_number, status, sizeof(status))) return 0;
+    if (strcmp(status, "PENDING_APPROVAL") != 0) return 0;
     return db_update_request_status(request_number, "APPROVED");
 }
 
 int core_reject_request(int request_number) {
+    char status[35];
+    if (!db_get_request_status(request_number, status, sizeof(status))) return 0;
+    if (strcmp(status, "PENDING_APPROVAL") != 0) return 0;
     return db_update_request_status(request_number, "REJECTED");
 }
 

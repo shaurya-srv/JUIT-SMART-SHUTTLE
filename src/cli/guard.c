@@ -60,17 +60,19 @@ void guardportal(void) {
         guard_choice = read_int();
 
         if (guard_choice == 1) {
-            if (core_approve_request(req_num))
+            if (core_approve_request(req_num)) {
                 printf("\nYour Request has been APPROVED.\n");
-            else
-                printf("\nFailed to approve request (database error).\n");
-            processed++;
+                processed++;
+            } else {
+                printf("\nCould not approve (already processed or database error).\n");
+            }
         } else if (guard_choice == 2) {
-            if (core_reject_request(req_num))
+            if (core_reject_request(req_num)) {
                 printf("\nRequest has been REJECTED.\n");
-            else
-                printf("\nFailed to reject request (database error).\n");
-            processed++;
+                processed++;
+            } else {
+                printf("\nCould not reject (already processed or database error).\n");
+            }
         } else {
             printf("\nInvalid choice. Request will remain pending.\n");
         }

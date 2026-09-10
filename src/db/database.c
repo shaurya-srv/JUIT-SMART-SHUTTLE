@@ -86,6 +86,10 @@ int db_init(const char *host, const char *user, const char *pass, const char *db
 
 void db_close(void) { if (db) { mysql_close(db); db = NULL; } }
 
+int db_ping(void) {
+    return (db != NULL && mysql_ping(db) == 0) ? 1 : 0;
+}
+
 // ============================================================
 // STUDENTS
 // ============================================================
@@ -300,6 +304,112 @@ int db_get_pending_request_summaries(request_summary_t *out, int max) {
     }
     mysql_free_result(res);
     return n;
+}
+
+// Fill one request_row_t from a joined SELECT row.
+// Column order: req#, name, roll, hostel, room, phone, pickup, dropoff, status
+static void fill_request_row(request_row_t *r, MYSQL_ROW row) {
+    r->request_number       = atoi(row[0] ? row[0] : "0");
+    snprintf(r->student_name,    sizeof(r->student_name),    "%s", row[1] ? row[1] : "");
+    r->student_roll_number  = atoi(row[2] ? row[2] : "0");
+    snprintf(r->hostel_name,     sizeof(r->hostel_name),     "%s", row[3] ? row[3] : "");
+    snprintf(r->room_number,     sizeof(r->room_number),     "%s", row[4] ? row[4] : "");
+    snprintf(r->phone_number,    sizeof(r->phone_number),    "%s", row[5] ? row[5] : "");
+    snprintf(r->pickup_place,    sizeof(r->pickup_place),    "%s", row[6] ? row[6] : "");
+    snprintf(r->dropoff_place,   sizeof(r->dropoff_place),   "%s", row[7] ? row[7] : "");
+    snprintf(r->status,          sizeof(r->status),          "%s", row[8] ? row[8] : "");
+    r->bus_number = 0;
+}
+
+#define REQUEST_ROWS_SELECT \
+    "SELECT r.request_number,s.name,s.roll_number,s.hostel_name,s.room_number," \
+    "s.phone_number,r.pickup_place,r.dropoff_place,r.status " \
+    "FROM pickup_requests r JOIN students s ON r.student_roll_number=s.roll_number "
+
+int db_get_request_rows_by_status(const char *status, request_row_t *out, int max) {
+    if (out == NULL || max <= 0) return 0;
+    char q[512];
+    if (status) {
+        // status values are program constants, never user input
+        snprintf(q, sizeof(q), REQUEST_ROWS_SELECT
+                 "WHERE r.status='%s' ORDER BY r.request_number", status);
+    } else {
+        snprintf(q, sizeof(q), REQUEST_ROWS_SELECT "ORDER BY r.request_number");
+    }
+    if (mysql_query(db, q) != 0) return -1;
+    MYSQL_RES *res = mysql_store_result(db);
+    if (!res) return -1;
+    int n = 0;
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res)) != NULL && n < max)
+        fill_request_row(&out[n++], row);
+    mysql_free_result(res);
+
+    // Batch-fill bus assignments (one query instead of one per request).
+    if (mysql_query(db, "SELECT request_number,bus_number FROM bus_assignments") != 0)
+        return n;
+    MYSQL_RES *ares = mysql_store_result(db);
+    if (!ares) return n;
+    MYSQL_ROW arow;
+    while ((arow = mysql_fetch_row(ares)) != NULL) {
+        int rn = atoi(arow[0] ? arow[0] : "0");
+        int bn = atoi(arow[1] ? arow[1] : "0");
+        for (int i = 0; i < n; i++) {
+            if (out[i].request_number == rn) { out[i].bus_number = bn; break; }
+        }
+    }
+    mysql_free_result(ares);
+    return n;
+}
+
+int db_get_request_rows_by_student(int roll_number, request_row_t *out, int max) {
+    if (out == NULL || max <= 0) return 0;
+    char q[512];
+    snprintf(q, sizeof(q), REQUEST_ROWS_SELECT
+             "WHERE r.student_roll_number=%d ORDER BY r.request_number DESC",
+             roll_number);
+    if (mysql_query(db, q) != 0) return -1;
+    MYSQL_RES *res = mysql_store_result(db);
+    if (!res) return -1;
+    int n = 0;
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res)) != NULL && n < max)
+        fill_request_row(&out[n++], row);
+    mysql_free_result(res);
+
+    if (mysql_query(db, "SELECT request_number,bus_number FROM bus_assignments") != 0)
+        return n;
+    MYSQL_RES *ares = mysql_store_result(db);
+    if (!ares) return n;
+    MYSQL_ROW arow;
+    while ((arow = mysql_fetch_row(ares)) != NULL) {
+        int rn = atoi(arow[0] ? arow[0] : "0");
+        int bn = atoi(arow[1] ? arow[1] : "0");
+        for (int i = 0; i < n; i++) {
+            if (out[i].request_number == rn) { out[i].bus_number = bn; break; }
+        }
+    }
+    mysql_free_result(ares);
+    return n;
+}
+
+int db_get_request_status(int request_number, char *out, size_t outsz) {
+    if (out == NULL || outsz == 0) return 0;
+    out[0] = '\0';
+    char q[128];
+    snprintf(q, sizeof(q), "SELECT status FROM pickup_requests WHERE request_number=%d",
+             request_number);
+    if (mysql_query(db, q) != 0) return 0;
+    MYSQL_RES *res = mysql_store_result(db);
+    if (!res) return 0;
+    MYSQL_ROW row = mysql_fetch_row(res);
+    int ok = 0;
+    if (row && row[0]) {
+        snprintf(out, outsz, "%s", row[0]);
+        ok = 1;
+    }
+    mysql_free_result(res);
+    return ok;
 }
 
 int db_count_buses(void) {

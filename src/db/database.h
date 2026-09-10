@@ -12,6 +12,14 @@ int db_get_buses(bus_t *out, int max);
 int db_get_request_routes_by_status(const char *status, request_route_t *out, int max);
 int db_get_pending_request_summaries(request_summary_t *out, int max);
 
+// Structured request rows (joined with student info) for list views.
+// status NULL = all statuses. Returns count, or -1 on a database error.
+int db_get_request_rows_by_status(const char *status, request_row_t *out, int max);
+// Requests of one student, newest first. Returns count, or -1 on error.
+int db_get_request_rows_by_student(int roll_number, request_row_t *out, int max);
+// Current status of one request into `out` (cap >= 35). 1 on success.
+int db_get_request_status(int request_number, char *out, size_t outsz);
+
 extern MYSQL *db;
 
 int db_init(const char *host, const char *user, const char *pass, const char *dbname, unsigned int port);
@@ -47,6 +55,9 @@ void db_create_default_credentials(void);
 
 // Migration
 void db_migrate_from_text_files(void);
+
+// Health check: 1 if the connection is alive (pings the server), 0 if not.
+int db_ping(void);
 
 // Reporting
 int db_view_bus_schedule(void);
