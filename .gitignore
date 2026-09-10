@@ -1,11 +1,25 @@
-# Compiled binary
+# Build artifacts
+*.o
+*.obj
 *.exe
 shuttle
 
+# Runtime databases (MySQL server holds the real data)
+*.db
+
+# Vendored connector files (large, user-specific)
+libmariadb.dll
+mysql_import.a
+mysql_include/
+
+# Data files from the old text-based storage
+studentregistration.txt
+pendingrequest.txt
+approvedrequest.txt
+rejectedrequest.txt
+
 # Temporary files
 temporary_file.txt
-
-# Bus schedule data
 busschedule.txt
 busassignments.txt
 
