@@ -17,6 +17,27 @@
 #define RESP_HDR_MAX 512
 #define POOL_SIZE   4      // concurrent connections; tune for expected load
 
+// ------------------------------------------------------------
+// Structured request logging
+// ------------------------------------------------------------
+
+static void log_request(const char *method, const char *path, int status, DWORD elapsed_ms) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    // Colour-code by status class.
+    const char *clr =
+        (status >= 200 && status < 300) ? "\033[32m" :   // green
+        (status >= 400 && status < 500) ? "\033[33m" :   // yellow
+        (status >= 500)                 ? "\033[31m" :   // red
+                                          "\033[0m";
+    fprintf(stderr,
+        "\033[0m[%04d-%02d-%02d %02d:%02d:%02d.%03d] "
+        "%s%-4s %s\033[0m \033[1m%d\033[0m %lums\n",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        clr, method, path, status, (unsigned long)elapsed_ms);
+}
+
 // Global shutdown flag (set by Ctrl+C handler).
 static volatile int g_running = 1;
 
@@ -120,9 +141,11 @@ static DWORD WINAPI connection_thread(LPVOID arg) {
     }
 
     // --- Dispatch (thread has its own connection — no lock needed) ---
+    DWORD t_start = GetTickCount64();
     static char res_body[16384];
     int status;
     status = api_handle_request(method, path, query, auth, body, res_body, sizeof(res_body));
+    DWORD elapsed = GetTickCount64() - t_start;
 
     const char *status_text =
         status == 200 ? "OK"            :
@@ -148,6 +171,9 @@ static DWORD WINAPI connection_thread(LPVOID arg) {
 
     send(client, hdr, hlen, 0);
     send(client, res_body, (int)strlen(res_body), 0);
+
+    // Log the request.
+    log_request(method, path, status, elapsed);
 
     // Return connection to pool, then close socket.
     db_pool_release();
