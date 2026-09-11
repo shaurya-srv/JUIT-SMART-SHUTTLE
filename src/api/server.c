@@ -186,7 +186,13 @@ static DWORD WINAPI connection_thread(LPVOID arg) {
 int main(void) {
     const char *mysql_host = getenv("SHUTTLE_DB_HOST"); if (!mysql_host) mysql_host = "127.0.0.1";
     const char *mysql_user = getenv("SHUTTLE_DB_USER"); if (!mysql_user) mysql_user = "root";
-    const char *mysql_pass = getenv("SHUTTLE_DB_PASS"); if (!mysql_pass) mysql_pass = "@ShauryA@2008@30@";
+    const char *mysql_pass = getenv("SHUTTLE_DB_PASS");
+    if (!mysql_pass) {
+        fprintf(stderr, "\nError: SHUTTLE_DB_PASS environment variable is not set.\n");
+        fprintf(stderr, "  Set it before running:  export SHUTTLE_DB_PASS=yourpassword\n\n");
+        WSACleanup();
+        return 1;
+    }
     const char *mysql_db   = getenv("SHUTTLE_DB_NAME"); if (!mysql_db)   mysql_db = "shuttle_db";
     const char *port_str   = getenv("SHUTTLE_DB_PORT");
     unsigned int mysql_port = port_str ? (unsigned int)atoi(port_str) : 3306;
