@@ -1,7 +1,7 @@
 # JUIT Smart Shuttle — Architecture Plan
 
-> Status: **PLAN** (agreed 2026-09-10). Web role: **C HTTP/JSON API**. Code layout: **split modules**.
-> Deferred items (do not block the plan): SQL string-escaping hardening, mingw32-make toolchain fix.
+> Status: **ALL PHASES COMPLETE** (2026-09-11). Web role: **C HTTP/JSON API**. Code layout: **split modules**.
+> All deferred items resolved: SQL escaping hardened, mingw32-make toolchain fixed.
 
 ## 1. Current state (what exists today)
 
@@ -95,8 +95,9 @@ shuttle/
 
 ### Phase 3 — HTTP/JSON API — **ENDPOINTS COMPLETE 2026-09-10**
 1. ✅ `src/api/server.c`: winsock2 listener on `127.0.0.1:8080` (loopback only),
-   one thread per connection, all handlers serialized under a CRITICAL_SECTION
-   (the DAL's single MYSQL* is not thread-safe — pool is the Phase 4 upgrade).
+   one thread per connection, each thread acquires its own MySQL connection from
+   a thread-local pool (pool implemented in Phase 5; original scaffold used a
+   CRITICAL_SECTION with a single connection).
    Built as `shuttle_api.exe` via `make api`. Live-tested with curl:
    health, login (all three roles, plus bad-credential/method/role paths),
    request creation (real DB write, token auth, role enforcement, route
@@ -160,6 +161,22 @@ shuttle/
    crypto (round-trip, fresh salts, tamper rejection, malformed stored
    strings, CSPRNG distinctness). Runners need no MySQL server.
 
+### Phase 5 — Operational hardening — **DONE 2026-09-11**
+1. ✅ **Connection pool**: thread-local MySQL connections via `__thread` TLS.
+   Pool of 4 connections (configurable `POOL_SIZE`) with mutex + condition
+   variable. Each API thread acquires a connection at request start, releases
+   at end — eliminates the single-connection `CRITICAL_SECTION` bottleneck.
+   `db_pool_init/acquire/release/shutdown` API in `database.h`. CLI uses
+   pool of 1. Verified with 4 concurrent curl requests completing in parallel.
+2. ✅ **Structured request logging**: every API request logged to stderr with
+   ISO-8601 timestamp (millisecond precision), HTTP method, path, status code
+   (color-coded: green 2xx, yellow 4xx, red 5xx), and duration in ms.
+3. ✅ **Mandatory database password**: `SHUTTLE_DB_PASS` environment variable
+   is now required. Both CLI and API server exit immediately with a clear error
+   if unset. No credentials are compiled into the binaries.
+4. ✅ **Graceful shutdown**: `SetConsoleCtrlHandler` catches Ctrl+C, closes the
+   listener, waits for in-flight threads, then cleanly shuts down the pool.
+
 ## 5. Decisions log
 
 | Date | Decision | Rationale |
@@ -167,12 +184,17 @@ shuttle/
 | 2026-09-10 | Web served by a C HTTP API | One language end-to-end; reuses `core/` + `db/` directly |
 | 2026-09-10 | Split module layout (cli/core/db/api) | Testable business rules; CLI and API share one implementation |
 | 2026-09-10 | SQL escaping + make fix deferred | User asked to defer; plan does not depend on them |
+| 2026-09-11 | TLS-based connection pool over CRITICAL_SECTION | Enables true concurrency; each thread owns its connection |
+| 2026-09-11 | Mandatory SHUTTLE_DB_PASS | Security: no credentials in source code or binaries |
+| 2026-09-11 | Log to stderr with timestamps | Debuggability without polluting stdout |
 
 ## 6. Risks / notes
 
-- MySQL password currently hard-coded in `main()` (env-var override added; consider
-  removing the compiled default before any deployment).
-- `mysql_real_connect` per process: CLI is fine; the API server should open a
-  connection per worker thread or use a small pool.
+- ✅ ~~MySQL password currently hard-coded~~ — removed in Phase 5; `SHUTTLE_DB_PASS`
+  env-var is mandatory.
+- ✅ ~~API server serialized under CRITICAL_SECTION~~ — replaced by connection pool
+  in Phase 5; 4 concurrent connections, verified with parallel requests.
 - `conio.h` (`getch`) is Windows-only — CLI stays Windows-only, which matches the
   current environment; `api/` has no such dependency.
+- Sessions remain in-memory (lost on restart) — acceptable for single-machine
+  deployment; consider Redis/DB-backed sessions for multi-node scaling.

@@ -42,17 +42,26 @@ REJECTED
 server built from the same `core/` and `db/` layers:
 
 ```bash
+export SHUTTLE_DB_PASS=yourpassword   # required
 make api       # builds shuttle_api.exe
 ./shuttle_api.exe   # listens on 127.0.0.1:8080 (loopback only)
 ```
 
-Then open `index.html` in a browser. Endpoints: `/api/health`, `/api/login`,
+Then open `index.html` in a browser. The server uses a **connection pool** (4
+concurrent MySQL connections by default) so multiple browser tabs and API calls
+are handled in parallel. Structured request logs (timestamp, method, path,
+status, duration) are written to stderr.
+
+Endpoints: `/api/health`, `/api/login`,
 `/api/register`, `/api/requests` (+ `/mine`, `/{id}/approve`, `/{id}/reject`),
 `/api/buses`, `/api/buses/assign`, `/api/assignments/unassign`,
 `/api/reports/capacity`.
 
 ## Security
 
+- **No credentials in source**: the `SHUTTLE_DB_PASS` environment variable is
+  required — both CLI and API server refuse to start without it. No passwords
+  are compiled into the binaries.
 - **Passwords** are never stored in plaintext: PBKDF2-HMAC-SHA256, 60,000
   iterations, per-user random 16-byte salt (Windows CNG). Legacy plaintext rows
   from the text-file migration upgrade automatically on the first successful
@@ -64,6 +73,8 @@ Then open `index.html` in a browser. Endpoints: `/api/health`, `/api/login`,
 - **Assignments are atomic**: seat count and assignment row change together in a
   transaction with a capacity guard, so concurrent assignment runs cannot
   overfill a bus.
+- **Connection pool**: each API thread gets its own MySQL connection from a pool,
+  eliminating serialization and enabling true concurrent request handling.
 
 ## Database Schema
 
@@ -98,14 +109,14 @@ Both run against an in-memory stub — no MySQL server required.
 make        # or: mingw32-make
 ```
 
-### Configure connection (optional)
-The client reads these environment variables (defaults shown):
+### Configure connection
+The client reads these environment variables:
 ```
-SHUTTLE_DB_HOST=127.0.0.1
-SHUTTLE_DB_USER=root
-SHUTTLE_DB_PASS=<set your password here>
-SHUTTLE_DB_NAME=shuttle_db
-SHUTTLE_DB_PORT=3306
+SHUTTLE_DB_HOST=127.0.0.1   # optional, default shown
+SHUTTLE_DB_USER=root         # optional, default shown
+SHUTTLE_DB_PASS=<required>   # mandatory — server exits if not set
+SHUTTLE_DB_NAME=shuttle_db   # optional, default shown
+SHUTTLE_DB_PORT=3306         # optional, default shown
 ```
 
 ### Run
