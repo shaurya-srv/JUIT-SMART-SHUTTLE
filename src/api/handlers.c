@@ -413,6 +413,40 @@ static int handle_capacity(char *res, size_t res_size) {
 }
 
 // ------------------------------------------------------------
+// POST /api/reset-password   (public; student forgot-password flow)
+//   {"roll_number":261030195,"new_password":"..."}
+// ------------------------------------------------------------
+
+static int handle_reset_password(const char *body, char *res, size_t res_size) {
+    long roll;
+    char new_password[31];
+    if (!json_get_int(body, "roll_number", &roll) || roll <= 0 ||
+        !json_get_string(body, "new_password", new_password, sizeof(new_password))) {
+        return respond_error(res, res_size, 400,
+            "roll_number and new_password are required");
+    }
+    if (strlen(new_password) < 4)
+        return respond_error(res, res_size, 400, "password must be at least 4 characters");
+    if (!db_student_exists((int)roll))
+        return respond_error(res, res_size, 404, "student not found");
+    // Hash the new password and update directly.
+    char hashed[PW_HASH_STORAGE_LEN];
+    if (!pw_hash(new_password, hashed, sizeof(hashed)))
+        return respond_error(res, res_size, 500, "hashing failed");
+    char ehashed[256];
+    MYSQL *c = db_conn();
+    if (!c) return respond_error(res, res_size, 500, "database error");
+    if (mysql_real_escape_string(c, ehashed, hashed, (unsigned long)strlen(hashed)) == 0)
+        return respond_error(res, res_size, 500, "escape failed");
+    char q[512];
+    snprintf(q, sizeof(q), "UPDATE students SET password='%s' WHERE roll_number=%d",
+             ehashed, (int)roll);
+    if (mysql_query(c, q) != 0)
+        return respond_error(res, res_size, 500, "update failed");
+    return respond(res, res_size, 200, "{\"reset\":true}");
+}
+
+// ------------------------------------------------------------
 // Dispatch
 //   auth_header: the raw Authorization header value ("" if absent)
 //   query:       raw query string ("" if absent)
@@ -436,6 +470,11 @@ int api_handle_request(const char *method, const char *path, const char *query,
         if (strcmp(method, "POST") != 0)
             return respond_error(res_body, res_size, 405, "method not allowed; use POST");
         return handle_register(body ? body : "", res_body, res_size);
+    }
+    if (strcmp(path, "/api/reset-password") == 0) {
+        if (strcmp(method, "POST") != 0)
+            return respond_error(res_body, res_size, 405, "method not allowed; use POST");
+        return handle_reset_password(body ? body : "", res_body, res_size);
     }
 
     // ---- authenticated endpoints ----

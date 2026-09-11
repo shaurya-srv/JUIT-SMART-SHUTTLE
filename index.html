@@ -230,6 +230,17 @@
     text-decoration: none;
   }
   .back-link:hover { text-decoration: underline; }
+  .forgot-link {
+    display: block;
+    text-align: center;
+    margin: 10px 0 0;
+    color: var(--primary);
+    font-size: .85rem;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .forgot-link:hover { text-decoration: underline; }
   table {
     width: 100%;
     border-collapse: collapse;
@@ -343,6 +354,7 @@ function showLogin() {
         <button class="password-toggle" onclick="togglePass()">👁</button>
       </div>
       <button class="btn btn-primary" onclick="doLogin()">Login</button>
+      <a class="forgot-link" onclick="showResetPassword()">🔑 Forgot Password?</a>
       <hr class="divider">
       <button class="btn btn-outline" onclick="showRegister()">📝 Register New Student</button>
     </div>
@@ -386,6 +398,50 @@ async function doLogin() {
 function showAlert(id, msg, type) {
   const el = document.getElementById(id);
   if (el) el.innerHTML = `<div class="alert alert-${type}">${msg}</div>`;
+}
+
+// ---------- RESET PASSWORD ----------
+function showResetPassword() {
+  render(`
+    <a class="back-link" onclick="showLogin()">← Back to Login</a>
+    <div class="card">
+      <h2><span class="icon">🔑</span> Reset Password</h2>
+      <div id="alert"></div>
+      <label>Roll Number</label>
+      <input type="number" id="reset_roll" placeholder="Enter your roll number">
+      <label>New Password</label>
+      <div class="password-wrap">
+        <input type="password" id="reset_pass" placeholder="Enter new password">
+        <button class="password-toggle" onclick="toggleResetPass()">👁</button>
+      </div>
+      <label>Confirm Password</label>
+      <input type="password" id="reset_pass2" placeholder="Confirm new password">
+      <button class="btn btn-primary" onclick="doResetPassword()">Reset Password</button>
+    </div>
+  `);
+}
+
+function toggleResetPass() {
+  const p = document.getElementById('reset_pass');
+  p.type = p.type === 'password' ? 'text' : 'password';
+}
+
+async function doResetPassword() {
+  const roll = parseInt(document.getElementById('reset_roll').value);
+  const pass = document.getElementById('reset_pass').value;
+  const pass2 = document.getElementById('reset_pass2').value;
+  if (!roll) return showAlert('alert', 'Please enter your roll number.', 'error');
+  if (!pass) return showAlert('alert', 'Please enter a new password.', 'error');
+  if (pass.length < 4) return showAlert('alert', 'Password must be at least 4 characters.', 'error');
+  if (pass !== pass2) return showAlert('alert', 'Passwords do not match.', 'error');
+
+  try {
+    await apiCall('POST', '/api/reset-password', { roll_number: roll, new_password: pass });
+    showAlert('alert', 'Password reset successful! You can now login.', 'success');
+    setTimeout(showLogin, 1500);
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
+  }
 }
 
 // ---------- REGISTER ----------
