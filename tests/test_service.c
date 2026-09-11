@@ -158,6 +158,43 @@ static void test_bad_args(void) {
     CHECK(db_get_request_routes_by_status("APPROVED", NULL, 5) == 0);
 }
 
+// ------------------------------------------------------------
+// Lifecycle transitions (core_approve_request / core_reject_request)
+// ------------------------------------------------------------
+
+static void test_lifecycle(void) {
+    RUN("approve: pending -> approved");
+    stub_reset();
+    stub_add_request(500, J, W);
+    CHECK(core_approve_request(500) == 1);
+    {
+        char st[40];
+        CHECK(db_get_request_status(500, st, sizeof(st)) == 1);
+        CHECK(strcmp(st, "APPROVED") == 0);
+    }
+
+    RUN("approve/reject refuse non-pending requests");
+    stub_reset();
+    stub_add_request(501, J, W);
+    stub_set_request_status(501, "APPROVED");
+    CHECK(core_approve_request(501) == 0);      // already approved
+    stub_set_request_status(501, "REJECTED");
+    CHECK(core_approve_request(501) == 0);      // rejected can't be approved
+    CHECK(core_reject_request(501) == 0);
+    stub_set_request_status(501, "PENDING_APPROVAL");
+    CHECK(core_reject_request(501) == 1);
+    {
+        char st[40];
+        CHECK(db_get_request_status(501, st, sizeof(st)) == 1);
+        CHECK(strcmp(st, "REJECTED") == 0);
+    }
+
+    RUN("lifecycle on unknown request fails cleanly");
+    stub_reset();
+    CHECK(core_approve_request(999) == 0);
+    CHECK(core_reject_request(999) == 0);
+}
+
 int main(void) {
     test_full_bus_skipped();
     test_mixed_routes();
@@ -166,6 +203,7 @@ int main(void) {
     test_db_error_path();
     test_empty_inputs();
     test_bad_args();
+    test_lifecycle();
 
     printf("\n%d test(s) run, %d assertion failure(s)\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

@@ -2,6 +2,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include "src/db/database.h"
+#include "src/core/crypto.h"
+#include "src/core/service.h"
 
 MYSQL *db = NULL;
 
@@ -33,14 +35,14 @@ int db_init(const char *host, const char *user, const char *pass, const char *db
         "  id INT AUTO_INCREMENT PRIMARY KEY,"
         "  name VARCHAR(35) NOT NULL, roll_number INT UNIQUE NOT NULL,"
         "  room_number VARCHAR(60) NOT NULL, hostel_name VARCHAR(30) NOT NULL,"
-        "  phone_number VARCHAR(15) NOT NULL, password VARCHAR(31) NOT NULL,"
+        "  phone_number VARCHAR(15) NOT NULL, password VARCHAR(160) NOT NULL,"
         "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
         ") ENGINE=InnoDB");
 
     mysql_query(db,
         "CREATE TABLE IF NOT EXISTS credentials ("
         "  id INT AUTO_INCREMENT PRIMARY KEY,"
-        "  role VARCHAR(32) UNIQUE NOT NULL, password VARCHAR(32) NOT NULL"
+        "  role VARCHAR(32) UNIQUE NOT NULL, password VARCHAR(160) NOT NULL"
         ") ENGINE=InnoDB");
 
     mysql_query(db,
@@ -80,6 +82,11 @@ int db_init(const char *host, const char *user, const char *pass, const char *db
     mysql_query(db, "CREATE INDEX idx_requests_student ON pickup_requests(student_roll_number)");
     mysql_query(db, "CREATE INDEX idx_buses_route ON buses(route_pickup, route_dropoff)");
 
+    // Widen legacy password columns (VARCHAR(31)/32) so hashed passwords fit.
+    // Errors are ignored on fresh databases where the column is already 160.
+    mysql_query(db, "ALTER TABLE students MODIFY password VARCHAR(160) NOT NULL");
+    mysql_query(db, "ALTER TABLE credentials MODIFY password VARCHAR(160) NOT NULL");
+
     printf("[INFO] Database schema ready.\n");
     return 1;
 }
@@ -90,6 +97,15 @@ int db_ping(void) {
     return (db != NULL && mysql_ping(db) == 0) ? 1 : 0;
 }
 
+// ------------------------------------------------------------
+// TRANSACTIONS — wrap multi-statement mutations so they succeed
+// or fail as one unit (atomic assignments, request numbers).
+// ------------------------------------------------------------
+
+int db_begin(void)    { return mysql_query(db, "START TRANSACTION") == 0; }
+int db_commit(void)   { return mysql_query(db, "COMMIT") == 0; }
+int db_rollback(void) { mysql_query(db, "ROLLBACK"); return 1; }
+
 // ============================================================
 // STUDENTS
 // ============================================================
@@ -99,12 +115,16 @@ int db_register_student(const char *name, int roll_no, const char *room,
     if (db_student_exists(roll_no)) {
         printf("\nStudent with roll %d already registered.\n", roll_no); return 0;
     }
-    char ename[80], eroom[130], ehostel[70], ephone[40], epass[70]; char q[1024];
+    // Salted PBKDF2 hash — plaintext is never stored.
+    char hashed[PW_HASH_STORAGE_LEN];
+    if (!pw_hash(password, hashed, sizeof(hashed))) return 0;
+
+    char ename[80], eroom[130], ehostel[70], ephone[40], epass[256]; char q[1400];
     db_escape(name, ename, sizeof(ename));
     db_escape(room, eroom, sizeof(eroom));
     db_escape(hostel, ehostel, sizeof(ehostel));
     db_escape(phone, ephone, sizeof(ephone));
-    db_escape(password, epass, sizeof(epass));
+    db_escape(hashed, epass, sizeof(epass));
     snprintf(q, sizeof(q),
         "INSERT INTO students (name,roll_number,room_number,hostel_name,phone_number,password) "
         "VALUES ('%s',%d,'%s','%s','%s','%s')", ename, roll_no, eroom, ehostel, ephone, epass);
@@ -140,12 +160,28 @@ int db_student_exists(int roll_no) {
 }
 
 int db_verify_student_password(int roll_no, const char *password) {
+    if (!password) return 0;
     char q[256];
     snprintf(q, sizeof(q), "SELECT password FROM students WHERE roll_number=%d", roll_no);
     if (mysql_query(db, q) != 0) return 0;
     MYSQL_RES *r = mysql_store_result(db); if (!r) return 0;
     MYSQL_ROW row = mysql_fetch_row(r);
-    int ok = (row && row[0] && password && strcmp(row[0], password) == 0);
+    int ok = 0;
+    if (row && row[0]) {
+        ok = pw_verify(password, row[0]);
+        // Legacy plaintext: re-hash on first successful login.
+        if (ok && strncmp(row[0], "pbkdf2-sha256$", 14) != 0) {
+            char hashed[PW_HASH_STORAGE_LEN];
+            char ehashed[256];
+            if (pw_hash(password, hashed, sizeof(hashed)) &&
+                db_escape(hashed, ehashed, sizeof(ehashed)) > 0) {
+                char uq[512];
+                snprintf(uq, sizeof(uq), "UPDATE students SET password='%s' WHERE roll_number=%d",
+                         ehashed, roll_no);
+                mysql_query(db, uq);
+            }
+        }
+    }
     mysql_free_result(r); return ok;
 }
 
@@ -154,16 +190,16 @@ int db_verify_student_password(int roll_no, const char *password) {
 // ============================================================
 
 int db_create_request(int roll_no, const char *pickup_place, const char *dropoff_place) {
-    int p=-1, d=-1;
-    if (strcmp(pickup_place,"JUIT")==0) p=0; else if (strcmp(pickup_place,"Ravli PG")==0) p=1;
-    else if (strcmp(pickup_place,"Peach Tree")==0) p=2; else if (strcmp(pickup_place,"Waknaghat")==0) p=3;
-    if (strcmp(dropoff_place,"JUIT")==0) d=0; else if (strcmp(dropoff_place,"Ravli PG")==0) d=1;
-    else if (strcmp(dropoff_place,"Peach Tree")==0) d=2; else if (strcmp(dropoff_place,"Waknaghat")==0) d=3;
-    if (p==-1||d==-1) { printf("\nInvalid location.\n"); return 0; }
-    if (p==d) { printf("\nPickup and dropoff cannot be the same.\n"); return 0; }
+    int p = core_location_from_name(pickup_place);
+    int d = core_location_from_name(dropoff_place);
+    if (p == -1 || d == -1) { printf("\nInvalid location.\n"); return 0; }
+    if (p == d) { printf("\nPickup and dropoff cannot be the same.\n"); return 0; }
 
+    // Allocate the request number inside a transaction so two concurrent
+    // creates can never pick the same MAX()+1 value.
+    if (!db_begin()) return 0;
     int rn = db_get_next_request_number();
-    int dir = (p<d)?1:-1;
+    int dir = (p < d) ? 1 : -1;
     char ep[80], ed[80]; char q[640];
     db_escape(pickup_place, ep, sizeof(ep));
     db_escape(dropoff_place, ed, sizeof(ed));
@@ -171,14 +207,21 @@ int db_create_request(int roll_no, const char *pickup_place, const char *dropoff
         "INSERT INTO pickup_requests (request_number,student_roll_number,pickup_place,dropoff_place,"
         "pickup_location,dropoff_location,direction,status) VALUES (%d,%d,'%s','%s',%d,%d,%d,'PENDING_APPROVAL')",
         rn, roll_no, ep, ed, p, d, dir);
-    if (mysql_query(db,q)!=0) { fprintf(stderr,"Create request failed: %s\n",mysql_error(db)); return 0; }
+    if (mysql_query(db, q) != 0) {
+        fprintf(stderr, "Create request failed: %s\n", mysql_error(db));
+        db_rollback(); return 0;
+    }
+    if (!db_commit()) { db_rollback(); return 0; }
     printf("\nPickup request created! Request #%d\n", rn);
     return rn;
 }
 
 int db_update_request_status(int request_number, const char *new_status) {
-    char q[256];
-    snprintf(q, sizeof(q), "UPDATE pickup_requests SET status='%s' WHERE request_number=%d", new_status, request_number);
+    if (new_status == NULL) return 0;
+    // status values are program constants, but escape defensively anyway
+    char es[80]; char q[256];
+    db_escape(new_status, es, sizeof(es));
+    snprintf(q, sizeof(q), "UPDATE pickup_requests SET status='%s' WHERE request_number=%d", es, request_number);
     if (mysql_query(db,q)!=0) { fprintf(stderr,"Update failed: %s\n",mysql_error(db)); return 0; }
     return mysql_affected_rows(db) > 0 ? 1 : 0;
 }
@@ -192,12 +235,13 @@ int db_get_next_request_number(void) {
 }
 
 int db_get_requests_by_status(const char *status) {
-    char q[512];
+    char es[80]; char q[512];
+    db_escape(status ? status : "", es, sizeof(es));
     snprintf(q, sizeof(q),
         "SELECT r.request_number,s.name,s.roll_number,s.hostel_name,s.room_number,"
         "s.phone_number,r.pickup_place,r.dropoff_place,r.status "
         "FROM pickup_requests r JOIN students s ON r.student_roll_number=s.roll_number "
-        "WHERE r.status='%s' ORDER BY r.request_number", status);
+        "WHERE r.status='%s' ORDER BY r.request_number", es);
     if (mysql_query(db,q)!=0) { fprintf(stderr,"Query error: %s\n",mysql_error(db)); return 0; }
     MYSQL_RES *r = mysql_store_result(db); if (!r) return 0;
     int count=0; MYSQL_ROW row;
@@ -266,11 +310,12 @@ int db_get_buses(bus_t *out, int max) {
 
 int db_get_request_routes_by_status(const char *status, request_route_t *out, int max) {
     if (out == NULL || max <= 0 || status == NULL) return 0;
-    // status values are program constants, not user input
-    char q[256];
+    // status values are program constants, but escape defensively anyway
+    char es[80]; char q[256];
+    db_escape(status, es, sizeof(es));
     snprintf(q, sizeof(q),
         "SELECT request_number,pickup_location,dropoff_location FROM pickup_requests "
-        "WHERE status='%s' ORDER BY request_number", status);
+        "WHERE status='%s' ORDER BY request_number", es);
     if (mysql_query(db, q) != 0) return -1;
     MYSQL_RES *res = mysql_store_result(db);
     if (!res) return -1;
@@ -330,9 +375,11 @@ int db_get_request_rows_by_status(const char *status, request_row_t *out, int ma
     if (out == NULL || max <= 0) return 0;
     char q[512];
     if (status) {
-        // status values are program constants, never user input
+        // status values are program constants, but escape defensively anyway
+        char es[80];
+        db_escape(status, es, sizeof(es));
         snprintf(q, sizeof(q), REQUEST_ROWS_SELECT
-                 "WHERE r.status='%s' ORDER BY r.request_number", status);
+                 "WHERE r.status='%s' ORDER BY r.request_number", es);
     } else {
         snprintf(q, sizeof(q), REQUEST_ROWS_SELECT "ORDER BY r.request_number");
     }
@@ -448,11 +495,29 @@ int db_update_bus_count(int bus_number, int delta) {
 // ASSIGNMENTS
 // ============================================================
 
+// Atomically place one request on a bus: the capacity-guarded UPDATE and the
+// assignment INSERT succeed or fail together inside one transaction.
 int db_assign_request_to_bus(int request_number, int bus_number) {
-    char q[256];
-    snprintf(q,sizeof(q),"INSERT INTO bus_assignments (request_number,bus_number) VALUES (%d,%d)",request_number,bus_number);
-    if (mysql_query(db,q)!=0) return 0;
-    db_update_bus_count(bus_number, 1);
+    if (!db_begin()) return 0;
+
+    // Guarded increment: only takes a seat if the bus still has one, so two
+    // concurrent runs can never overfill the same bus.
+    char q[512];
+    snprintf(q, sizeof(q),
+        "UPDATE buses SET current_count=current_count+1 "
+        "WHERE bus_number=%d AND current_count<max_capacity", bus_number);
+    if (mysql_query(db, q) != 0 || mysql_affected_rows(db) != 1) {
+        db_rollback(); return 0;               // bus full or unknown
+    }
+
+    snprintf(q, sizeof(q),
+        "INSERT INTO bus_assignments (request_number,bus_number) VALUES (%d,%d)",
+        request_number, bus_number);
+    if (mysql_query(db, q) != 0) {
+        db_rollback(); return 0;               // duplicate assignment, FK issue, ...
+    }
+
+    if (!db_commit()) { db_rollback(); return 0; }
     return 1;
 }
 
@@ -467,14 +532,26 @@ int db_is_request_assigned(int request_number) {
 }
 
 int db_unassign_request(int request_number) {
-    int bn=0; char q[256];
-    snprintf(q,sizeof(q),"SELECT bus_number FROM bus_assignments WHERE request_number=%d",request_number);
-    if (mysql_query(db,q)==0) { MYSQL_RES *r=mysql_store_result(db); if(r){MYSQL_ROW row=mysql_fetch_row(r); if(row)bn=atoi(row[0]); mysql_free_result(r);} }
-    if (bn==0) { printf("\nRequest %d is not assigned.\n",request_number); return 0; }
-    snprintf(q,sizeof(q),"DELETE FROM bus_assignments WHERE request_number=%d",request_number);
-    if (mysql_query(db,q)!=0) return 0;
-    db_update_bus_count(bn,-1);
-    printf("\nRequest %d unassigned from bus %d.\n",request_number,bn);
+    if (!db_begin()) return 0;
+
+    char q[256]; int bn = 0;
+    snprintf(q, sizeof(q), "SELECT bus_number FROM bus_assignments WHERE request_number=%d", request_number);
+    if (mysql_query(db, q) != 0) { db_rollback(); return 0; }
+    MYSQL_RES *r = mysql_store_result(db);
+    if (!r) { db_rollback(); return 0; }
+    MYSQL_ROW row = mysql_fetch_row(r);
+    if (row && row[0]) bn = atoi(row[0]);
+    mysql_free_result(r);
+    if (bn == 0) { db_rollback(); printf("\nRequest %d is not assigned.\n", request_number); return 0; }
+
+    snprintf(q, sizeof(q), "DELETE FROM bus_assignments WHERE request_number=%d", request_number);
+    if (mysql_query(db, q) != 0) { db_rollback(); return 0; }
+
+    snprintf(q, sizeof(q), "UPDATE buses SET current_count=current_count-1 WHERE bus_number=%d AND current_count>0", bn);
+    if (mysql_query(db, q) != 0) { db_rollback(); return 0; }
+
+    if (!db_commit()) { db_rollback(); return 0; }
+    printf("\nRequest %d unassigned from bus %d.\n", request_number, bn);
     return 1;
 }
 
@@ -483,24 +560,48 @@ int db_unassign_request(int request_number) {
 // ============================================================
 
 int db_verify_role_password(const char *role, const char *password) {
-    char q[256];
-    snprintf(q,sizeof(q),"SELECT password FROM credentials WHERE role='%s'",role);
-    if (mysql_query(db,q)!=0) return 0;
-    MYSQL_RES *r=mysql_store_result(db); if(!r) return 0;
-    MYSQL_ROW row=mysql_fetch_row(r);
-    int ok = (row && row[0] && password && strcmp(row[0], password) == 0);
+    if (!role || !password) return 0;
+    char erole[80]; char q[256];
+    db_escape(role, erole, sizeof(erole));
+    snprintf(q, sizeof(q), "SELECT password FROM credentials WHERE role='%s'", erole);
+    if (mysql_query(db, q) != 0) return 0;
+    MYSQL_RES *r = mysql_store_result(db); if (!r) return 0;
+    MYSQL_ROW row = mysql_fetch_row(r);
+    int ok = 0;
+    if (row && row[0]) {
+        ok = pw_verify(password, row[0]);
+        // Legacy plaintext default creds: re-hash on first successful login.
+        if (ok && strncmp(row[0], "pbkdf2-sha256$", 14) != 0) {
+            char hashed[PW_HASH_STORAGE_LEN];
+            char ehashed[256];
+            if (pw_hash(password, hashed, sizeof(hashed)) &&
+                db_escape(hashed, ehashed, sizeof(ehashed)) > 0) {
+                char uq[512];
+                snprintf(uq, sizeof(uq), "UPDATE credentials SET password='%s' WHERE role='%s'",
+                         ehashed, erole);
+                mysql_query(db, uq);
+            }
+        }
+    }
     mysql_free_result(r); return ok;
 }
 
 void db_create_default_credentials(void) {
-    if (mysql_query(db,"SELECT COUNT(*) FROM credentials")!=0) return;
-    MYSQL_RES *r=mysql_store_result(db); if(!r) return;
-    MYSQL_ROW row=mysql_fetch_row(r);
-    int c=(row&&row[0])?atoi(row[0]):0;
-    mysql_free_result(r); if(c>0) return;
+    if (mysql_query(db, "SELECT COUNT(*) FROM credentials") != 0) return;
+    MYSQL_RES *r = mysql_store_result(db); if (!r) return;
+    MYSQL_ROW row = mysql_fetch_row(r);
+    int c = (row && row[0]) ? atoi(row[0]) : 0;
+    mysql_free_result(r); if (c > 0) return;
 
-    mysql_query(db,"INSERT INTO credentials (role,password) VALUES ('guard','guard123')");
-    mysql_query(db,"INSERT INTO credentials (role,password) VALUES ('scheduler','scheduler123')");
+    char g[PW_HASH_STORAGE_LEN], s[PW_HASH_STORAGE_LEN], eg[256], es[256];
+    if (pw_hash("guard123", g, sizeof(g)) && pw_hash("scheduler123", s, sizeof(s)) &&
+        db_escape(g, eg, sizeof(eg)) > 0 && db_escape(s, es, sizeof(es)) > 0) {
+        char q[700];
+        snprintf(q, sizeof(q),
+            "INSERT INTO credentials (role,password) VALUES ('guard','%s'),('scheduler','%s')",
+            eg, es);
+        mysql_query(db, q);
+    }
     printf("\n[INFO] Default credentials: guard/guard123, scheduler/scheduler123\n");
 }
 
@@ -547,8 +648,12 @@ void db_migrate_from_text_files(void) {
             int pl=-1,dl=-1;
             if(strcmp(p,"JUIT")==0)pl=0;else if(strcmp(p,"Ravli PG")==0)pl=1;else if(strcmp(p,"Peach Tree")==0)pl=2;else if(strcmp(p,"Waknaghat")==0)pl=3;
             if(strcmp(d,"JUIT")==0)dl=0;else if(strcmp(d,"Ravli PG")==0)dl=1;else if(strcmp(d,"Peach Tree")==0)dl=2;else if(strcmp(d,"Waknaghat")==0)dl=3;
+            // Legacy file text is untrusted — escape before splicing into SQL.
+            char ep[70], ed[70];
+            db_escape(p, ep, sizeof(ep));
+            db_escape(d, ed, sizeof(ed));
             char q[512];
-            snprintf(q,sizeof(q),"INSERT IGNORE INTO pickup_requests (request_number,student_roll_number,pickup_place,dropoff_place,pickup_location,dropoff_location,direction,status) VALUES (%d,%d,'%s','%s',%d,%d,0,'%s')",rn,roll,p,d,pl,dl,files[i].s);
+            snprintf(q,sizeof(q),"INSERT IGNORE INTO pickup_requests (request_number,student_roll_number,pickup_place,dropoff_place,pickup_location,dropoff_location,direction,status) VALUES (%d,%d,'%s','%s',%d,%d,0,'%s')",rn,roll,ep,ed,pl,dl,files[i].s);
             mysql_query(db,q);
         }
         fclose(f); printf("  [OK] %s requests migrated\n",files[i].s);

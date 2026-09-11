@@ -17,9 +17,16 @@ int db_is_request_assigned(int request_number);
 int db_assign_request_to_bus(int request_number, int bus_number);
 int db_update_request_status(int request_number, const char *new_status);
 int db_get_request_status(int request_number, char *out, size_t outsz);
+int db_begin(void);
+int db_commit(void);
+int db_rollback(void);
 
 // Reset all stub state to empty (no buses, no requests, no fail flags).
 void stub_reset(void);
+
+// Lifecycle fixtures for core_approve/reject tests:
+// seed a request's stored status (default is PENDING_APPROVAL).
+int stub_set_request_status(int request_number, const char *status);
 
 // Add a bus / an approved request to the fake data.
 // Returns index of the stored entry, or -1 if full.

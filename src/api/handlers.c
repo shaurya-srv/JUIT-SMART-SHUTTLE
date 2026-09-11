@@ -9,24 +9,29 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include "handlers.h"
 #include "json.h"
 #include "src/db/database.h"
 #include "src/core/models.h"
 #include "src/core/service.h"
+#include "src/core/crypto.h"
 
 // ------------------------------------------------------------
-// Sessions (in-memory, scaffold-grade; CSPRNG+expiry in Phase 4)
+// Sessions: 128-bit CSPRNG tokens, 8-hour sliding expiry.
+// Still in-memory (lost on restart — documented limitation).
 // ------------------------------------------------------------
 
 #define MAX_SESSIONS 64
-#define TOKEN_LEN    33
+#define TOKEN_LEN    33                 // 32 hex chars + NUL
+#define SESSION_TTL  (8 * 60 * 60)      // seconds; sliding
 
 typedef struct {
     int  active;
     char token[TOKEN_LEN];
     int  role;
     int  roll_number;   // students only
+    time_t expires_at;
 } session_t;
 
 static session_t sessions[MAX_SESSIONS];
@@ -34,11 +39,32 @@ static session_t sessions[MAX_SESSIONS];
 void api_handlers_init(void)     { memset(sessions, 0, sizeof(sessions)); }
 void api_handlers_shutdown(void) { memset(sessions, 0, sizeof(sessions)); }
 
+static void session_fill_token(session_t *s) {
+    unsigned char raw[16];
+    if (crypto_random_bytes(raw, sizeof(raw))) {
+        static const char hex[] = "0123456789abcdef";
+        for (int i = 0; i < 16; i++) {
+            s->token[i * 2]     = hex[raw[i] >> 4];
+            s->token[i * 2 + 1] = hex[raw[i] & 0x0f];
+        }
+        s->token[32] = '\0';
+    } else {
+        s->token[0] = '\0';   // session_create treats this as failure
+    }
+}
+
 static session_t *session_find(const char *token) {
     if (token == NULL || token[0] == '\0') return NULL;
+    time_t now = time(NULL);
     for (int i = 0; i < MAX_SESSIONS; i++) {
-        if (sessions[i].active && strcmp(sessions[i].token, token) == 0)
+        if (sessions[i].active && strcmp(sessions[i].token, token) == 0) {
+            if (now >= sessions[i].expires_at) {   // expired
+                sessions[i].active = 0;
+                return NULL;
+            }
+            sessions[i].expires_at = now + SESSION_TTL;   // sliding renewal
             return &sessions[i];
+        }
     }
     return NULL;
 }
@@ -46,14 +72,12 @@ static session_t *session_find(const char *token) {
 static void session_create(session_t *out, int role, int roll_number) {
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (!sessions[i].active) {
+            session_fill_token(&sessions[i]);
+            if (sessions[i].token[0] == '\0') break;  // RNG failure -> no session
             sessions[i].active = 1;
             sessions[i].role = role;
             sessions[i].roll_number = roll_number;
-            unsigned long v = ((unsigned long)rand() << 17) ^ (unsigned long)time(NULL)
-                            ^ (unsigned long)(i * 2654435761u);
-            snprintf(sessions[i].token, TOKEN_LEN, "%08lx%08lx%08lx",
-                     v & 0xffffffffUL, (v >> 13) & 0xffffffffUL,
-                     (unsigned long)(roll_number * 0x9e3779b9u) & 0xffffffffUL);
+            sessions[i].expires_at = time(NULL) + SESSION_TTL;
             memcpy(out, &sessions[i], sizeof(*out));
             return;
         }

@@ -11,7 +11,8 @@ static bus_t            s_buses[MAX_BUSES];
 static int              s_bus_count;
 static request_route_t  s_requests[512];
 static int              s_request_count;
-static int              s_assigned[512]; // parallel to s_requests: bus# or 0
+static int              s_assigned[512];  // parallel to s_requests: bus# or 0
+static char             s_status[512][40]; // parallel: lifecycle status
 static int              s_fail_next_assign;
 
 void stub_reset(void) {
@@ -21,6 +22,7 @@ void stub_reset(void) {
     memset(s_buses, 0, sizeof(s_buses));
     memset(s_requests, 0, sizeof(s_requests));
     memset(s_assigned, 0, sizeof(s_assigned));
+    memset(s_status, 0, sizeof(s_status));
 }
 
 int stub_add_bus(int bus_number, int route_pickup, int route_dropoff,
@@ -40,7 +42,18 @@ int stub_add_request(int request_number, int pickup_location, int dropoff_locati
     s_requests[s_request_count].pickup_location = pickup_location;
     s_requests[s_request_count].dropoff_location = dropoff_location;
     s_assigned[s_request_count] = 0;
+    snprintf(s_status[s_request_count], sizeof(s_status[0]), "PENDING_APPROVAL");
     return s_request_count++;
+}
+
+int stub_set_request_status(int request_number, const char *status) {
+    for (int i = 0; i < s_request_count; i++) {
+        if (s_requests[i].request_number == request_number) {
+            snprintf(s_status[i], sizeof(s_status[0]), "%s", status);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void stub_fail_next_assign(void) {
@@ -71,10 +84,11 @@ int db_is_request_assigned(int request_number) {
 }
 
 int db_update_request_status(int request_number, const char *new_status) {
-    (void)new_status; // lifecycle transitions are not asserted in these tests
     for (int i = 0; i < s_request_count; i++) {
-        if (s_requests[i].request_number == request_number)
+        if (s_requests[i].request_number == request_number) {
+            snprintf(s_status[i], sizeof(s_status[0]), "%s", new_status);
             return 1;
+        }
     }
     return 0;
 }
@@ -82,18 +96,19 @@ int db_update_request_status(int request_number, const char *new_status) {
 int db_get_request_status(int request_number, char *out, size_t outsz) {
     if (out == NULL || outsz == 0) return 0;
     out[0] = '\0';
-    // The stub only serves the assignment algorithm, whose requests are all
-    // implicitly APPROVED — so lifecycle checks in core_approve/reject would
-    // refuse to act on them. Report PENDING_APPROVAL to keep those paths
-    // reachable in the assignment tests.
     for (int i = 0; i < s_request_count; i++) {
         if (s_requests[i].request_number == request_number) {
-            snprintf(out, outsz, "PENDING_APPROVAL");
+            snprintf(out, outsz, "%s", s_status[i]);
             return 1;
         }
     }
     return 0;
 }
+
+// Transactions: no-ops — the stub has no concurrency to guard.
+int db_begin(void)    { return 1; }
+int db_commit(void)   { return 1; }
+int db_rollback(void) { return 1; }
 
 int db_assign_request_to_bus(int request_number, int bus_number) {
     if (s_fail_next_assign) {

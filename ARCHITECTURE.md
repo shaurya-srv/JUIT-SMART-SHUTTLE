@@ -126,35 +126,39 @@ shuttle/
 2. ✅ `src/api/json.{h,c}`: minimal flat-object parser (string/int) and escaper,
    no external deps.
 3. ✅ Scaffold auth: password check via db, in-memory session table (rand-based
-   tokens — replace with CSPRNG + expiry in Phase 4).
-   | GET | /api/requests?status= | list by status (guard/scheduler) |
-   | GET | /api/requests/mine | student's own requests |
-   | POST | /api/requests/{id}/approve · /reject | guard actions |
-   | GET/POST | /api/buses | list / register buses |
-   | POST | /api/buses/assign | run assignment algorithm |
-   | POST | /api/assignments/unassign | remove assignment |
-   | GET | /api/reports/capacity | route capacity summary |
-2. `api/json.c`: minimal encode/decode (no external deps).
-3. Auth: password check via `core/`, session token in memory; plaintext passwords
-   must be hashed before this ships (see §6).
+   tokens — replaced with CSPRNG + expiry in Phase 4).
 4. ✅ `index.html` rewritten: same UI, `fetch()` calls to `shuttle_api` replace the
    localStorage layer (only the session token persists locally). All portals —
    student, guard, scheduler — now read/write real MySQL data. Server gained
    CORS (preflight + headers) and Content-Length-aware body reads for browser
    clients; new public `POST /api/register` mirrors CLI registration.
 
-### Phase 4 — Hardening
-1. Transactions: assignment capacity check + insert atomic; stop `MAX(request_number)+1`
-   (use the existing `AUTO_INCREMENT id`).
-2. Password hashing (salted) for students + role credentials.
-3. SQL string escaping audit across `db/` (the deferred fix).
-4. Unit tests for `core/` — **assignment algorithm done 2026-09-10** (`make test`):
-   `tests/test_service.c` runs `core_assign_approved_requests()` against an
-   in-memory db stub (`tests/stub_db.c`), no MySQL needed. Covers: full-bus
-   skipping, exact-route matching, first-match ordering, reverse-direction
-   requests, 80% warning firing once per bus, already-assigned skipping,
-   db-failure resilience, empty inputs, NULL-result tolerance.
-   Still to do: lifecycle-transition tests.
+### Phase 4 — Hardening — **DONE 2026-09-10**
+1. ✅ **Session tokens**: 128-bit CSPRNG hex tokens via Windows CNG
+   (`crypto_random_bytes`), 8-hour sliding expiry, expired sessions lazily
+   invalidated (`src/api/handlers.c`). Sessions remain in-memory (lost on
+   restart — acceptable for this deployment).
+2. ✅ **Password hashing**: PBKDF2-HMAC-SHA256, 60k iterations, 16-byte random
+   salt (`src/core/crypto.c`, format `pbkdf2-sha256$<iter>$<salt>$<hash>`).
+   Applied at registration and to role credentials. Legacy plaintext rows
+   (migrated data) upgrade transparently on first successful login.
+   Schema: password columns widened to VARCHAR(160).
+3. ✅ **SQL escaping audit**: all remaining string→SQL paths escaped via
+   `mysql_real_escape_string` — migration file text, status parameters
+   (defensive, they are program constants), role lookup. Passwords are
+   hash-strings escaped like any other input.
+4. ✅ **Atomic assignments**: `db_assign_request_to_bus()` now does a
+   capacity-guarded UPDATE (`WHERE current_count<max_capacity`) + assignment
+   INSERT in one transaction — concurrent runs can never overfill a bus.
+   `db_create_request()` allocates request numbers inside a transaction;
+   `db_unassign_request()` is transactional. The whole assignment run is
+   wrapped in one transaction (`core_assign_approved_requests`).
+5. ✅ **Unit tests** (`make test` → 10/10, `make test-crypto` → 6/6):
+   assignment algorithm (full-bus skip, exact-route match, 80% warning,
+   db-failure resilience, empty inputs, NULL tolerance) + lifecycle
+   transitions (pending→approved, non-pending refusals, unknown request) +
+   crypto (round-trip, fresh salts, tamper rejection, malformed stored
+   strings, CSPRNG distinctness). Runners need no MySQL server.
 
 ## 5. Decisions log
 

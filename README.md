@@ -36,15 +36,53 @@ APPROVED ──► Bus Scheduler Portal
 REJECTED
 ```
 
+## HTTP/JSON API (web)
+
+`index.html` is a browser client for the same workflow — it calls a small HTTP/JSON
+server built from the same `core/` and `db/` layers:
+
+```bash
+make api       # builds shuttle_api.exe
+./shuttle_api.exe   # listens on 127.0.0.1:8080 (loopback only)
+```
+
+Then open `index.html` in a browser. Endpoints: `/api/health`, `/api/login`,
+`/api/register`, `/api/requests` (+ `/mine`, `/{id}/approve`, `/{id}/reject`),
+`/api/buses`, `/api/buses/assign`, `/api/assignments/unassign`,
+`/api/reports/capacity`.
+
+## Security
+
+- **Passwords** are never stored in plaintext: PBKDF2-HMAC-SHA256, 60,000
+  iterations, per-user random 16-byte salt (Windows CNG). Legacy plaintext rows
+  from the text-file migration upgrade automatically on the first successful
+  login. Portal passwords seeded on first run (`guard123`, `scheduler123`) are
+  hashed like any other — change them via the app.
+- **Session tokens** are 128-bit CSPRNG values with an 8-hour sliding expiry.
+- **All user strings** are escaped with `mysql_real_escape_string` before they
+  reach SQL; request statuses are validated against a whitelist at the API layer.
+- **Assignments are atomic**: seat count and assignment row change together in a
+  transaction with a capacity guard, so concurrent assignment runs cannot
+  overfill a bus.
+
 ## Database Schema
 
 | Table | Purpose |
 |-------|---------|
-| `students` | Registered students (roll number unique, password) |
-| `credentials` | Role passwords for guard and scheduler portals |
+| `students` | Registered students (roll number unique, PBKDF2 password hash) |
+| `credentials` | Role passwords for guard and scheduler portals (PBKDF2 hashes) |
 | `pickup_requests` | Shuttle requests with status (`PENDING_APPROVAL`, `APPROVED`, `REJECTED`) |
 | `buses` | Registered buses with route and capacity |
 | `bus_assignments` | Request-to-bus mapping (one assignment per request) |
+
+## Tests
+
+```bash
+make test          # core: assignment algorithm + lifecycle transitions (10 tests)
+make test-crypto   # crypto: PBKDF2 hashing + CSPRNG (6 tests)
+```
+
+Both run against an in-memory stub — no MySQL server required.
 
 ## How to Compile and Run
 
@@ -81,9 +119,14 @@ Guard and scheduler passwords are seeded on first run: `guard/guard123` and `sch
 
 ## Project Structure
 
-| File | Description |
-|------|-------------|
-| `index.c` | Main source: menus, portals, assignment logic |
-| `database.c` / `database.h` | MySQL data-access layer (all DB queries) |
-| `Makefile` | Build script (MSYS2 mingw64 toolchain) |
-| `index.html` | Web frontend for the same workflow |
+```
+src/
+  main.c            — CLI entry point + login page
+  cli/              — per-portal UIs (student, guard, scheduler) + shared I/O
+  core/             — business rules (assignment, lifecycle, locations) + crypto
+  db/               — MySQL data-access layer (the only place that speaks SQL)
+  api/              — HTTP/JSON server (winsock2) for the web frontend
+tests/              — unit tests (in-memory db stub, no MySQL needed)
+index.html          — web frontend (calls the API)
+ARCHITECTURE.md     — design decisions and phased plan
+```

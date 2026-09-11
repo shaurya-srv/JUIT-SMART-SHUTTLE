@@ -59,6 +59,12 @@ void db_migrate_from_text_files(void);
 // Health check: 1 if the connection is alive (pings the server), 0 if not.
 int db_ping(void);
 
+// Transactions: wrap multi-statement mutations (atomic assignments,
+// request-number allocation). 1 on success.
+int db_begin(void);
+int db_commit(void);
+int db_rollback(void);
+
 // Reporting
 int db_view_bus_schedule(void);
 int db_view_route_capacity(void);

@@ -59,13 +59,18 @@ int core_reject_request(int request_number) {
 int core_assign_approved_requests(core_assign_result_t *result) {
     if (result) memset(result, 0, sizeof(*result));
 
+    // One transaction for the whole run: snapshot consistency for the
+    // loaders, and every placement (each itself an atomic capacity-guarded
+    // insert) commits or rolls back together.
+    if (!db_begin()) return 0;
+
     bus_t buses[MAX_BUSES];
     int bus_count = db_get_buses(buses, MAX_BUSES);
-    if (bus_count < 0) return 0;               // database error
+    if (bus_count < 0) { db_rollback(); return 0; }   // database error
 
     request_route_t reqs[CORE_MAX_REQUESTS];
     int req_count = db_get_request_routes_by_status("APPROVED", reqs, CORE_MAX_REQUESTS);
-    if (req_count < 0) return 0;               // database error
+    if (req_count < 0) { db_rollback(); return 0; }   // database error
 
     int assigned = 0;
 
@@ -112,5 +117,6 @@ int core_assign_approved_requests(core_assign_result_t *result) {
         if (!placed && result) result->no_bus_available++;
     }
 
+    if (!db_commit()) { db_rollback(); return 0; }
     return 1;
 }
