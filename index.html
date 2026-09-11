@@ -279,9 +279,13 @@
 
 <script>
 // ============================================================
-// API CLIENT (shuttle_api on 127.0.0.1:8080)
+// API CLIENT
+// On Vercel: API is served from the same origin (relative paths).
+// Locally: API runs on shuttle_api at 127.0.0.1:8080.
 // ============================================================
-const API = 'http://127.0.0.1:8080';
+const API = window.location.port === '8080'
+  ? 'http://127.0.0.1:8080'           // running against local C server
+  : window.location.origin;            // deployed (Vercel or same-origin)
 
 // Wraps fetch with timeout + JSON handling; throws Error(message) on
 // non-2xx using the API's {"error":"..."} body.
