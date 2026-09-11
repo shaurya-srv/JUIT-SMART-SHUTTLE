@@ -1,8 +1,6 @@
 // shuttle_api — HTTP/JSON server exposing core/ + db/ to the web frontend.
 // Winsock2 listener on 127.0.0.1:8080, one thread per connection.
-// All handlers run under one critical section because the DAL's single
-// MYSQL* connection is not thread-safe (scaffold: serialized; Phase 4:
-// connection pool).
+// Each thread acquires its own MySQL connection from the pool — no global lock.
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -17,15 +15,27 @@
 #define LISTEN_PORT 8080
 #define RECV_SIZE   8192
 #define RESP_HDR_MAX 512
+#define POOL_SIZE   4      // concurrent connections; tune for expected load
 
-static CRITICAL_SECTION g_db_lock;
+// Global shutdown flag (set by Ctrl+C handler).
+static volatile int g_running = 1;
 
-// ------------------------------------------------------------
-// One connection: read request, dispatch, write response, close.
+static BOOL WINAPI ctrl_handler(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT) {
+        printf("\n[INFO] Shutting down...\n");
+        g_running = 0;
+        return TRUE;
+    }
+    return FALSE;
+}
+
 // ------------------------------------------------------------
 
 static DWORD WINAPI connection_thread(LPVOID arg) {
     SOCKET client = (SOCKET)(intptr_t)arg;
+
+    // Each thread gets its own MySQL connection from the pool.
+    db_pool_acquire();
 
     char req[RECV_SIZE];
     int total = 0;
@@ -34,12 +44,12 @@ static DWORD WINAPI connection_thread(LPVOID arg) {
         if (n <= 0) break;
         total += n;
         req[total] = '\0';
-        if (strstr(req, "\r\n\r\n")) break;               // end of headers
-        if (total >= (int)sizeof(req) - 1) break;          // buffer full
+        if (strstr(req, "\r\n\r\n")) break;
+        if (total >= (int)sizeof(req) - 1) break;
     }
     req[total] = '\0';
 
-    // --- Parse request line: METHOD SP PATH SP VERSION ---
+    // --- Parse request line ---
     char method[8] = "", target[512] = "";
     const char *headers = "";
     {
@@ -51,7 +61,7 @@ static DWORD WINAPI connection_thread(LPVOID arg) {
         }
     }
 
-    // --- CORS preflight: answer immediately, no body ---
+    // --- CORS preflight ---
     if (strcmp(method, "OPTIONS") == 0) {
         const char *preflight =
             "HTTP/1.1 204 No Content\r\n"
@@ -61,6 +71,7 @@ static DWORD WINAPI connection_thread(LPVOID arg) {
             "Connection: close\r\n"
             "\r\n";
         send(client, preflight, (int)strlen(preflight), 0);
+        db_pool_release();
         closesocket(client);
         return 0;
     }
@@ -85,8 +96,7 @@ static DWORD WINAPI connection_thread(LPVOID arg) {
         }
     }
 
-    // --- Body: honor Content-Length; browsers send headers and body in
-    // separate packets, so keep recv'ing until we have it all. ---
+    // --- Body: honor Content-Length ---
     const char *body = "";
     {
         const char *body_start = strstr(headers, "\r\n\r\n");
@@ -109,12 +119,10 @@ static DWORD WINAPI connection_thread(LPVOID arg) {
         }
     }
 
-    // --- Dispatch under the db lock ---
-    static char res_body[16384];   // static: per-thread stack too small for lists
+    // --- Dispatch (thread has its own connection — no lock needed) ---
+    static char res_body[16384];
     int status;
-    EnterCriticalSection(&g_db_lock);
     status = api_handle_request(method, path, query, auth, body, res_body, sizeof(res_body));
-    LeaveCriticalSection(&g_db_lock);
 
     const char *status_text =
         status == 200 ? "OK"            :
@@ -140,12 +148,13 @@ static DWORD WINAPI connection_thread(LPVOID arg) {
 
     send(client, hdr, hlen, 0);
     send(client, res_body, (int)strlen(res_body), 0);
+
+    // Return connection to pool, then close socket.
+    db_pool_release();
     closesocket(client);
     return 0;
 }
 
-// ------------------------------------------------------------
-// Entry point
 // ------------------------------------------------------------
 
 int main(void) {
@@ -163,15 +172,22 @@ int main(void) {
         return 1;
     }
 
+    // Initialize the connection pool (creates additional connections).
+    db_pool_init(POOL_SIZE);
+    printf("[INFO] Connection pool: %d connections\n", POOL_SIZE);
+
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         fprintf(stderr, "WSAStartup failed.\n");
+        db_pool_shutdown();
         db_close();
         return 1;
     }
 
-    InitializeCriticalSection(&g_db_lock);
     api_handlers_init();
+
+    // Graceful shutdown on Ctrl+C.
+    SetConsoleCtrlHandler(ctrl_handler, TRUE);
 
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listener == INVALID_SOCKET) {
@@ -186,12 +202,13 @@ int main(void) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons(LISTEN_PORT);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");   // loopback only
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
         fprintf(stderr, "bind() failed on 127.0.0.1:%d (error %d)\n", LISTEN_PORT, WSAGetLastError());
         closesocket(listener);
         WSACleanup();
+        db_pool_shutdown();
         db_close();
         return 1;
     }
@@ -199,11 +216,13 @@ int main(void) {
         fprintf(stderr, "listen() failed: %d\n", WSAGetLastError());
         closesocket(listener);
         WSACleanup();
+        db_pool_shutdown();
         db_close();
         return 1;
     }
 
     printf("Listening on http://127.0.0.1:%d  (Ctrl+C to stop)\n", LISTEN_PORT);
+    printf("  Pool size: %d concurrent connections\n", POOL_SIZE);
     printf("  GET|POST  /api/health\n");
     printf("  POST      /api/login\n");
     printf("  POST      /api/requests                (student)\n");
@@ -215,20 +234,21 @@ int main(void) {
     printf("  POST      /api/assignments/unassign     (scheduler)\n");
     printf("  GET       /api/reports/capacity         (scheduler/guard)\n\n");
 
-    for (;;) {
+    while (g_running) {
         SOCKET client = accept(listener, NULL, NULL);
         if (client == INVALID_SOCKET) continue;
         HANDLE t = CreateThread(NULL, 0, connection_thread,
                                 (LPVOID)(intptr_t)client, 0, NULL);
-        if (t) CloseHandle(t);           // detached; thread cleans up its socket
+        if (t) CloseHandle(t);
         else closesocket(client);
     }
 
-    // Unreachable, but keeps the cleanup story explicit:
+    // Graceful cleanup.
     closesocket(listener);
-    DeleteCriticalSection(&g_db_lock);
     api_handlers_shutdown();
-    WSACleanup();
+    db_pool_shutdown();
     db_close();
+    WSACleanup();
+    printf("[INFO] Server stopped.\n");
     return 0;
 }

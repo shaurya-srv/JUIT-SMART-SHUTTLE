@@ -6,6 +6,24 @@
 // Domain types are shared with core/ (models.h defines them).
 #include "src/core/models.h"
 
+// ------------------------------------------------------------
+// Connection pool (thread-local connections)
+// ------------------------------------------------------------
+// db_pool_init(n)   — create n connections, stored in a fixed pool.
+// db_pool_acquire() — hand a connection to the calling thread (TLS).
+//                     Returns 1 on success, 0 if none available (5 s timeout).
+// db_pool_release() — return the thread's connection to the pool.
+// db_conn()         — returns the calling thread's active connection (or NULL).
+// db_pool_shutdown() — close all pool connections.
+// db_pool_active()  — number of connections currently checked out.
+#define DB_POOL_MAX 8
+int  db_pool_init(int pool_size);
+void db_pool_acquire(void);
+void db_pool_release(void);
+void db_pool_shutdown(void);
+int  db_pool_active(void);
+MYSQL *db_conn(void);
+
 // Loaders for core/ and CLI list views — fill up to `max` entries,
 // return count, or -1 on a database error.
 int db_get_buses(bus_t *out, int max);
@@ -20,6 +38,8 @@ int db_get_request_rows_by_student(int roll_number, request_row_t *out, int max)
 // Current status of one request into `out` (cap >= 35). 1 on success.
 int db_get_request_status(int request_number, char *out, size_t outsz);
 
+// Backward-compatible global for CLI single-threaded use.
+// API code should use db_conn() instead.
 extern MYSQL *db;
 
 int db_init(const char *host, const char *user, const char *pass, const char *dbname, unsigned int port);

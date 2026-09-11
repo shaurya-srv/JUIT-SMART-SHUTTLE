@@ -1,35 +1,206 @@
+// Connection pool: each thread gets its own MySQL connection via TLS.
+// The pool is a fixed-size array guarded by a mutex + condition variable.
+// db_conn() returns the calling thread's connection; all db_* functions
+// use it.  The global `db` is kept for CLI backward compatibility and
+// for schema setup during db_init().
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <windows.h>
 #include "src/db/database.h"
 #include "src/core/crypto.h"
 #include "src/core/service.h"
 
+// ============================================================
+// CONNECTION POOL
+// ============================================================
+
+typedef struct {
+    MYSQL *conn;
+    int    in_use;
+} pool_slot_t;
+
+static pool_slot_t  pool[DB_POOL_MAX];
+static int          pool_size   = 0;
+static int          pool_active = 0;   // connections currently checked out
+static CRITICAL_SECTION pool_cs;
+static HANDLE          pool_cv;        // manual-reset event used as condition var
+
+// Backward-compat global for CLI single-threaded use.
 MYSQL *db = NULL;
 
-// Escape a user-supplied string for safe inclusion in a single-quoted SQL literal.
-// Returns the escaped length, or 0 if input is empty/invalid.
-static unsigned long db_escape(const char *in, char *out, size_t outsz) {
-    if (in == NULL || out == NULL || outsz == 0) return 0;
-    if (in[0] == '\0') { out[0] = '\0'; return 0; }
-    return mysql_real_escape_string(db, out, in, (unsigned long)strlen(in));
+// Connection parameters (saved for pool growth / reconnection).
+static const char *saved_host = NULL;
+static const char *saved_user = NULL;
+static const char *saved_pass = NULL;
+static const char *saved_dbn  = NULL;
+static unsigned int saved_port = 0;
+
+// Thread-local: the connection checked out by the current thread.
+static __thread MYSQL *tls_conn = NULL;
+
+MYSQL *db_conn(void) {
+    return tls_conn;
+}
+
+int db_pool_init(int n) {
+    if (n < 1) n = 1;
+    if (n > DB_POOL_MAX) n = DB_POOL_MAX;
+    InitializeCriticalSection(&pool_cs);
+    pool_cv = CreateEvent(NULL, TRUE, TRUE, NULL);  // manual-reset, initially signaled
+    pool_size = n;
+    for (int i = 0; i < n; i++) {
+        pool[i].conn   = NULL;
+        pool[i].in_use = 0;
+    }
+    return 1;
+}
+
+// Connect one pool slot.  Called from db_init() and lazily from acquire().
+static int pool_connect_slot(int idx) {
+    if (saved_host == NULL) return 0;  // no params saved yet
+    if (pool[idx].conn != NULL) return 1;  // already connected
+    pool[idx].conn = mysql_init(NULL);
+    if (pool[idx].conn == NULL) return 0;
+    if (mysql_real_connect(pool[idx].conn, saved_host, saved_user, saved_pass,
+                           saved_dbn, saved_port, NULL, 0) == NULL) {
+        fprintf(stderr, "[pool] connect failed (slot %d): %s\n",
+                idx, mysql_error(pool[idx].conn));
+        mysql_close(pool[idx].conn);
+        pool[idx].conn = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+// Save connection parameters so pool slots can be (re)connected later.
+static void pool_save_params(const char *host, const char *user,
+                             const char *pass, const char *dbname,
+                             unsigned int port) {
+    saved_host = host;
+    saved_user = user;
+    saved_pass = pass;
+    saved_dbn  = dbname;
+    saved_port = port;
+}
+
+// Hand a free connection to the calling thread.  Blocks up to 5 seconds
+// if the pool is exhausted, then returns 0 (no connection available).
+void db_pool_acquire(void) {
+    if (tls_conn != NULL) return;  // already holding one
+
+    EnterCriticalSection(&pool_cs);
+    for (;;) {
+        // Look for an idle slot.
+        for (int i = 0; i < pool_size; i++) {
+            if (!pool[i].in_use && pool[i].conn != NULL) {
+                pool[i].in_use = 1;
+                pool_active++;
+                tls_conn = pool[i].conn;
+                LeaveCriticalSection(&pool_cs);
+                return;
+            }
+        }
+        // Try to lazily connect an empty slot.
+        for (int i = 0; i < pool_size; i++) {
+            if (!pool[i].in_use && pool[i].conn == NULL) {
+                if (pool_connect_slot(i)) {
+                    pool[i].in_use = 1;
+                    pool_active++;
+                    tls_conn = pool[i].conn;
+                    LeaveCriticalSection(&pool_cs);
+                    return;
+                }
+            }
+        }
+        // All slots busy — wait on the condition variable for 5 s.
+        ResetEvent(pool_cv);
+        LeaveCriticalSection(&pool_cs);
+        WaitForSingleObject(pool_cv, 5000);
+        EnterCriticalSection(&pool_cs);
+    }
+    // unreachable (loop exits via return inside)
+}
+
+// Return the calling thread's connection to the pool.
+void db_pool_release(void) {
+    if (tls_conn == NULL) return;
+
+    EnterCriticalSection(&pool_cs);
+    for (int i = 0; i < pool_size; i++) {
+        if (pool[i].conn == tls_conn) {
+            pool[i].in_use = 0;
+            pool_active--;
+            break;
+        }
+    }
+    tls_conn = NULL;
+    SetEvent(pool_cv);              // wake one waiter
+    LeaveCriticalSection(&pool_cs);
+}
+
+// Close every pool connection.
+void db_pool_shutdown(void) {
+    EnterCriticalSection(&pool_cs);
+    for (int i = 0; i < pool_size; i++) {
+        if (pool[i].conn) {
+            mysql_close(pool[i].conn);
+            pool[i].conn   = NULL;
+            pool[i].in_use = 0;
+        }
+    }
+    pool_active = 0;
+    tls_conn    = NULL;
+    LeaveCriticalSection(&pool_cs);
+    DeleteCriticalSection(&pool_cs);
+    CloseHandle(pool_cv);
+}
+
+int db_pool_active(void) {
+    EnterCriticalSection(&pool_cs);
+    int n = pool_active;
+    LeaveCriticalSection(&pool_cs);
+    return n;
 }
 
 // ============================================================
-// INIT
+// ESCAPE HELPER (uses thread-local connection)
 // ============================================================
 
-int db_init(const char *host, const char *user, const char *pass, const char *dbname, unsigned int port) {
+static unsigned long db_escape(const char *in, char *out, size_t outsz) {
+    MYSQL *c = db_conn();
+    if (c == NULL || in == NULL || out == NULL || outsz == 0) return 0;
+    if (in[0] == '\0') { out[0] = '\0'; return 0; }
+    return mysql_real_escape_string(c, out, in, (unsigned long)strlen(in));
+}
+
+// ============================================================
+// INIT  (also seeds the pool with one connection for the caller)
+// ============================================================
+
+int db_init(const char *host, const char *user, const char *pass,
+            const char *dbname, unsigned int port) {
+    // Backward-compat: keep a global connection for CLI use.
     db = mysql_init(NULL);
     if (db == NULL) { fprintf(stderr, "mysql_init() failed\n"); return 0; }
-
     if (mysql_real_connect(db, host, user, pass, dbname, port, NULL, 0) == NULL) {
         fprintf(stderr, "Connection failed: %s\n", mysql_error(db));
         mysql_close(db); db = NULL; return 0;
     }
     printf("\n[INFO] Connected to MySQL '%s' at %s:%u\n", dbname, host, port);
 
-    // Create tables
+    // Save params so the pool can create additional connections.
+    pool_save_params(host, user, pass, dbname, port);
+
+    // Seed pool slot 0 with the global connection so db_pool_acquire() works
+    // immediately (before db_pool_init is called, or if pool_init is skipped).
+    if (pool_size > 0 && pool[0].conn == NULL) {
+        pool[0].conn   = db;
+        pool[0].in_use = 0;
+    }
+
+    // Create schema on the global connection.
     mysql_query(db,
         "CREATE TABLE IF NOT EXISTS students ("
         "  id INT AUTO_INCREMENT PRIMARY KEY,"
@@ -82,8 +253,7 @@ int db_init(const char *host, const char *user, const char *pass, const char *db
     mysql_query(db, "CREATE INDEX idx_requests_student ON pickup_requests(student_roll_number)");
     mysql_query(db, "CREATE INDEX idx_buses_route ON buses(route_pickup, route_dropoff)");
 
-    // Widen legacy password columns (VARCHAR(31)/32) so hashed passwords fit.
-    // Errors are ignored on fresh databases where the column is already 160.
+    // Widen legacy password columns so hashed passwords fit.
     mysql_query(db, "ALTER TABLE students MODIFY password VARCHAR(160) NOT NULL");
     mysql_query(db, "ALTER TABLE credentials MODIFY password VARCHAR(160) NOT NULL");
 
@@ -91,20 +261,23 @@ int db_init(const char *host, const char *user, const char *pass, const char *db
     return 1;
 }
 
-void db_close(void) { if (db) { mysql_close(db); db = NULL; } }
-
-int db_ping(void) {
-    return (db != NULL && mysql_ping(db) == 0) ? 1 : 0;
+void db_close(void) {
+    if (db) { mysql_close(db); db = NULL; }
 }
 
-// ------------------------------------------------------------
-// TRANSACTIONS — wrap multi-statement mutations so they succeed
-// or fail as one unit (atomic assignments, request numbers).
-// ------------------------------------------------------------
+int db_ping(void) {
+    MYSQL *c = db_conn();
+    if (c == NULL) return 0;
+    return mysql_ping(c) == 0 ? 1 : 0;
+}
 
-int db_begin(void)    { return mysql_query(db, "START TRANSACTION") == 0; }
-int db_commit(void)   { return mysql_query(db, "COMMIT") == 0; }
-int db_rollback(void) { mysql_query(db, "ROLLBACK"); return 1; }
+// ============================================================
+// TRANSACTIONS
+// ============================================================
+
+int db_begin(void)    { MYSQL *c = db_conn(); return c && mysql_query(c, "START TRANSACTION") == 0; }
+int db_commit(void)   { MYSQL *c = db_conn(); return c && mysql_query(c, "COMMIT") == 0; }
+int db_rollback(void) { MYSQL *c = db_conn(); if (c) mysql_query(c, "ROLLBACK"); return 1; }
 
 // ============================================================
 // STUDENTS
@@ -112,10 +285,11 @@ int db_rollback(void) { mysql_query(db, "ROLLBACK"); return 1; }
 
 int db_register_student(const char *name, int roll_no, const char *room,
                         const char *hostel, const char *phone, const char *password) {
+    MYSQL *c = db_conn();
+    if (!c) return 0;
     if (db_student_exists(roll_no)) {
         printf("\nStudent with roll %d already registered.\n", roll_no); return 0;
     }
-    // Salted PBKDF2 hash — plaintext is never stored.
     char hashed[PW_HASH_STORAGE_LEN];
     if (!pw_hash(password, hashed, sizeof(hashed))) return 0;
 
@@ -128,16 +302,18 @@ int db_register_student(const char *name, int roll_no, const char *room,
     snprintf(q, sizeof(q),
         "INSERT INTO students (name,roll_number,room_number,hostel_name,phone_number,password) "
         "VALUES ('%s',%d,'%s','%s','%s','%s')", ename, roll_no, eroom, ehostel, ephone, epass);
-    if (mysql_query(db, q) != 0) { fprintf(stderr, "Register failed: %s\n", mysql_error(db)); return 0; }
+    if (mysql_query(c, q) != 0) { fprintf(stderr, "Register failed: %s\n", mysql_error(c)); return 0; }
     printf("\nStudent registration successful!\n");
     return 1;
 }
 
 int db_find_student(int roll_no, char *name, char *room, char *hostel, char *phone) {
+    MYSQL *c = db_conn();
+    if (!c) return 0;
     char q[256];
     snprintf(q, sizeof(q), "SELECT name,room_number,hostel_name,phone_number FROM students WHERE roll_number=%d", roll_no);
-    if (mysql_query(db, q) != 0) return 0;
-    MYSQL_RES *r = mysql_store_result(db); if (!r) return 0;
+    if (mysql_query(c, q) != 0) return 0;
+    MYSQL_RES *r = mysql_store_result(c); if (!r) return 0;
     MYSQL_ROW row = mysql_fetch_row(r); int found = 0;
     if (row) {
         if (name) strcpy(name, row[0]?row[0]:"");
@@ -150,26 +326,28 @@ int db_find_student(int roll_no, char *name, char *room, char *hostel, char *pho
 }
 
 int db_student_exists(int roll_no) {
+    MYSQL *c = db_conn();
+    if (!c) return 0;
     char q[256];
     snprintf(q, sizeof(q), "SELECT COUNT(*) FROM students WHERE roll_number=%d", roll_no);
-    if (mysql_query(db, q) != 0) return 0;
-    MYSQL_RES *r = mysql_store_result(db); if (!r) return 0;
+    if (mysql_query(c, q) != 0) return 0;
+    MYSQL_RES *r = mysql_store_result(c); if (!r) return 0;
     MYSQL_ROW row = mysql_fetch_row(r);
-    int c = (row&&row[0]) ? atoi(row[0]) : 0;
-    mysql_free_result(r); return c > 0;
+    int cr = (row&&row[0]) ? atoi(row[0]) : 0;
+    mysql_free_result(r); return cr > 0;
 }
 
 int db_verify_student_password(int roll_no, const char *password) {
-    if (!password) return 0;
+    MYSQL *c = db_conn();
+    if (!password || !c) return 0;
     char q[256];
     snprintf(q, sizeof(q), "SELECT password FROM students WHERE roll_number=%d", roll_no);
-    if (mysql_query(db, q) != 0) return 0;
-    MYSQL_RES *r = mysql_store_result(db); if (!r) return 0;
+    if (mysql_query(c, q) != 0) return 0;
+    MYSQL_RES *r = mysql_store_result(c); if (!r) return 0;
     MYSQL_ROW row = mysql_fetch_row(r);
     int ok = 0;
     if (row && row[0]) {
         ok = pw_verify(password, row[0]);
-        // Legacy plaintext: re-hash on first successful login.
         if (ok && strncmp(row[0], "pbkdf2-sha256$", 14) != 0) {
             char hashed[PW_HASH_STORAGE_LEN];
             char ehashed[256];
@@ -178,7 +356,7 @@ int db_verify_student_password(int roll_no, const char *password) {
                 char uq[512];
                 snprintf(uq, sizeof(uq), "UPDATE students SET password='%s' WHERE roll_number=%d",
                          ehashed, roll_no);
-                mysql_query(db, uq);
+                mysql_query(c, uq);
             }
         }
     }
@@ -190,13 +368,13 @@ int db_verify_student_password(int roll_no, const char *password) {
 // ============================================================
 
 int db_create_request(int roll_no, const char *pickup_place, const char *dropoff_place) {
+    MYSQL *c = db_conn();
+    if (!c) return 0;
     int p = core_location_from_name(pickup_place);
     int d = core_location_from_name(dropoff_place);
     if (p == -1 || d == -1) { printf("\nInvalid location.\n"); return 0; }
     if (p == d) { printf("\nPickup and dropoff cannot be the same.\n"); return 0; }
 
-    // Allocate the request number inside a transaction so two concurrent
-    // creates can never pick the same MAX()+1 value.
     if (!db_begin()) return 0;
     int rn = db_get_next_request_number();
     int dir = (p < d) ? 1 : -1;
@@ -207,8 +385,8 @@ int db_create_request(int roll_no, const char *pickup_place, const char *dropoff
         "INSERT INTO pickup_requests (request_number,student_roll_number,pickup_place,dropoff_place,"
         "pickup_location,dropoff_location,direction,status) VALUES (%d,%d,'%s','%s',%d,%d,%d,'PENDING_APPROVAL')",
         rn, roll_no, ep, ed, p, d, dir);
-    if (mysql_query(db, q) != 0) {
-        fprintf(stderr, "Create request failed: %s\n", mysql_error(db));
+    if (mysql_query(c, q) != 0) {
+        fprintf(stderr, "Create request failed: %s\n", mysql_error(c));
         db_rollback(); return 0;
     }
     if (!db_commit()) { db_rollback(); return 0; }
@@ -217,24 +395,28 @@ int db_create_request(int roll_no, const char *pickup_place, const char *dropoff
 }
 
 int db_update_request_status(int request_number, const char *new_status) {
-    if (new_status == NULL) return 0;
-    // status values are program constants, but escape defensively anyway
+    MYSQL *c = db_conn();
+    if (!c || new_status == NULL) return 0;
     char es[80]; char q[256];
     db_escape(new_status, es, sizeof(es));
     snprintf(q, sizeof(q), "UPDATE pickup_requests SET status='%s' WHERE request_number=%d", es, request_number);
-    if (mysql_query(db,q)!=0) { fprintf(stderr,"Update failed: %s\n",mysql_error(db)); return 0; }
-    return mysql_affected_rows(db) > 0 ? 1 : 0;
+    if (mysql_query(c,q)!=0) { fprintf(stderr,"Update failed: %s\n",mysql_error(c)); return 0; }
+    return mysql_affected_rows(c) > 0 ? 1 : 0;
 }
 
 int db_get_next_request_number(void) {
-    if (mysql_query(db, "SELECT COALESCE(MAX(request_number),0)+1 FROM pickup_requests")!=0) return 1;
-    MYSQL_RES *r = mysql_store_result(db); if (!r) return 1;
+    MYSQL *c = db_conn();
+    if (!c) return 1;
+    if (mysql_query(c, "SELECT COALESCE(MAX(request_number),0)+1 FROM pickup_requests")!=0) return 1;
+    MYSQL_RES *r = mysql_store_result(c); if (!r) return 1;
     MYSQL_ROW row = mysql_fetch_row(r);
     int n = (row&&row[0]) ? atoi(row[0]) : 1;
     mysql_free_result(r); return n;
 }
 
 int db_get_requests_by_status(const char *status) {
+    MYSQL *c = db_conn();
+    if (!c) return 0;
     char es[80]; char q[512];
     db_escape(status ? status : "", es, sizeof(es));
     snprintf(q, sizeof(q),
@@ -242,8 +424,8 @@ int db_get_requests_by_status(const char *status) {
         "s.phone_number,r.pickup_place,r.dropoff_place,r.status "
         "FROM pickup_requests r JOIN students s ON r.student_roll_number=s.roll_number "
         "WHERE r.status='%s' ORDER BY r.request_number", es);
-    if (mysql_query(db,q)!=0) { fprintf(stderr,"Query error: %s\n",mysql_error(db)); return 0; }
-    MYSQL_RES *r = mysql_store_result(db); if (!r) return 0;
+    if (mysql_query(c,q)!=0) { fprintf(stderr,"Query error: %s\n",mysql_error(c)); return 0; }
+    MYSQL_RES *r = mysql_store_result(c); if (!r) return 0;
     int count=0; MYSQL_ROW row;
     while ((row=mysql_fetch_row(r))) {
         int rn=atoi(row[0]); const char *nm=row[1]?row[1]:""; int roll=atoi(row[2]);
@@ -252,7 +434,7 @@ int db_get_requests_by_status(const char *status) {
 
         int bn=0; char aq[256];
         snprintf(aq,sizeof(aq),"SELECT bus_number FROM bus_assignments WHERE request_number=%d",rn);
-        if (mysql_query(db,aq)==0) { MYSQL_RES *ar=mysql_store_result(db); if(ar){MYSQL_ROW ar2=mysql_fetch_row(ar); if(ar2)bn=atoi(ar2[0]); mysql_free_result(ar);} }
+        if (mysql_query(c,aq)==0) { MYSQL_RES *ar=mysql_store_result(c); if(ar){MYSQL_ROW ar2=mysql_fetch_row(ar); if(ar2)bn=atoi(ar2[0]); mysql_free_result(ar);} }
 
         printf("\n  [%d] %s (Roll: %d)", rn, nm, roll);
         printf("\n  Hostel: %s | Room: %s | Phone: %s", hos, rm, ph);
@@ -264,18 +446,20 @@ int db_get_requests_by_status(const char *status) {
 }
 
 int db_get_student_requests(int roll_no) {
+    MYSQL *c = db_conn();
+    if (!c) return 0;
     char q[512];
     snprintf(q, sizeof(q),
         "SELECT request_number,pickup_place,dropoff_place,status "
         "FROM pickup_requests WHERE student_roll_number=%d ORDER BY request_number DESC", roll_no);
-    if (mysql_query(db,q)!=0) return 0;
-    MYSQL_RES *r = mysql_store_result(db); if (!r) return 0;
+    if (mysql_query(c,q)!=0) return 0;
+    MYSQL_RES *r = mysql_store_result(c); if (!r) return 0;
     int count=0; MYSQL_ROW row;
     while ((row=mysql_fetch_row(r))) {
         int rn=atoi(row[0]); const char *pk=row[1]?row[1]:""; const char *dp=row[2]?row[2]:""; const char *st=row[3]?row[3]:"";
         int bn=0; char aq[256];
         snprintf(aq,sizeof(aq),"SELECT bus_number FROM bus_assignments WHERE request_number=%d",rn);
-        if (mysql_query(db,aq)==0) { MYSQL_RES *ar=mysql_store_result(db); if(ar){MYSQL_ROW ar2=mysql_fetch_row(ar); if(ar2)bn=atoi(ar2[0]); mysql_free_result(ar);} }
+        if (mysql_query(c,aq)==0) { MYSQL_RES *ar=mysql_store_result(c); if(ar){MYSQL_ROW ar2=mysql_fetch_row(ar); if(ar2)bn=atoi(ar2[0]); mysql_free_result(ar);} }
         printf("\n  [%d] %s -> %s | Status: %s", rn, pk, dp, st);
         if (bn>0) printf(" | Bus: %d", bn);
         count++;
@@ -287,12 +471,12 @@ int db_get_student_requests(int roll_no) {
 // BUSES
 // ============================================================
 
-// Loaders for core/ — fill up to max entries, return count, or -1 on db error.
 int db_get_buses(bus_t *out, int max) {
-    if (out == NULL || max <= 0) return 0;
-    if (mysql_query(db, "SELECT bus_number,route_pickup,route_dropoff,current_count,max_capacity "
+    MYSQL *c = db_conn();
+    if (!c || out == NULL || max <= 0) return 0;
+    if (mysql_query(c, "SELECT bus_number,route_pickup,route_dropoff,current_count,max_capacity "
                          "FROM buses ORDER BY bus_number") != 0) return -1;
-    MYSQL_RES *res = mysql_store_result(db);
+    MYSQL_RES *res = mysql_store_result(c);
     if (!res) return -1;
     int n = 0;
     MYSQL_ROW row;
@@ -309,15 +493,15 @@ int db_get_buses(bus_t *out, int max) {
 }
 
 int db_get_request_routes_by_status(const char *status, request_route_t *out, int max) {
-    if (out == NULL || max <= 0 || status == NULL) return 0;
-    // status values are program constants, but escape defensively anyway
+    MYSQL *c = db_conn();
+    if (!c || out == NULL || max <= 0 || status == NULL) return 0;
     char es[80]; char q[256];
     db_escape(status, es, sizeof(es));
     snprintf(q, sizeof(q),
         "SELECT request_number,pickup_location,dropoff_location FROM pickup_requests "
         "WHERE status='%s' ORDER BY request_number", es);
-    if (mysql_query(db, q) != 0) return -1;
-    MYSQL_RES *res = mysql_store_result(db);
+    if (mysql_query(c, q) != 0) return -1;
+    MYSQL_RES *res = mysql_store_result(c);
     if (!res) return -1;
     int n = 0;
     MYSQL_ROW row;
@@ -332,11 +516,12 @@ int db_get_request_routes_by_status(const char *status, request_route_t *out, in
 }
 
 int db_get_pending_request_summaries(request_summary_t *out, int max) {
-    if (out == NULL || max <= 0) return 0;
-    if (mysql_query(db, "SELECT request_number,student_roll_number,pickup_place,dropoff_place "
+    MYSQL *c = db_conn();
+    if (!c || out == NULL || max <= 0) return 0;
+    if (mysql_query(c, "SELECT request_number,student_roll_number,pickup_place,dropoff_place "
                          "FROM pickup_requests WHERE status='PENDING_APPROVAL' ORDER BY request_number") != 0)
         return -1;
-    MYSQL_RES *res = mysql_store_result(db);
+    MYSQL_RES *res = mysql_store_result(c);
     if (!res) return -1;
     int n = 0;
     MYSQL_ROW row;
@@ -351,8 +536,6 @@ int db_get_pending_request_summaries(request_summary_t *out, int max) {
     return n;
 }
 
-// Fill one request_row_t from a joined SELECT row.
-// Column order: req#, name, roll, hostel, room, phone, pickup, dropoff, status
 static void fill_request_row(request_row_t *r, MYSQL_ROW row) {
     r->request_number       = atoi(row[0] ? row[0] : "0");
     snprintf(r->student_name,    sizeof(r->student_name),    "%s", row[1] ? row[1] : "");
@@ -372,10 +555,10 @@ static void fill_request_row(request_row_t *r, MYSQL_ROW row) {
     "FROM pickup_requests r JOIN students s ON r.student_roll_number=s.roll_number "
 
 int db_get_request_rows_by_status(const char *status, request_row_t *out, int max) {
-    if (out == NULL || max <= 0) return 0;
+    MYSQL *c = db_conn();
+    if (!c || out == NULL || max <= 0) return 0;
     char q[512];
     if (status) {
-        // status values are program constants, but escape defensively anyway
         char es[80];
         db_escape(status, es, sizeof(es));
         snprintf(q, sizeof(q), REQUEST_ROWS_SELECT
@@ -383,8 +566,8 @@ int db_get_request_rows_by_status(const char *status, request_row_t *out, int ma
     } else {
         snprintf(q, sizeof(q), REQUEST_ROWS_SELECT "ORDER BY r.request_number");
     }
-    if (mysql_query(db, q) != 0) return -1;
-    MYSQL_RES *res = mysql_store_result(db);
+    if (mysql_query(c, q) != 0) return -1;
+    MYSQL_RES *res = mysql_store_result(c);
     if (!res) return -1;
     int n = 0;
     MYSQL_ROW row;
@@ -392,10 +575,9 @@ int db_get_request_rows_by_status(const char *status, request_row_t *out, int ma
         fill_request_row(&out[n++], row);
     mysql_free_result(res);
 
-    // Batch-fill bus assignments (one query instead of one per request).
-    if (mysql_query(db, "SELECT request_number,bus_number FROM bus_assignments") != 0)
+    if (mysql_query(c, "SELECT request_number,bus_number FROM bus_assignments") != 0)
         return n;
-    MYSQL_RES *ares = mysql_store_result(db);
+    MYSQL_RES *ares = mysql_store_result(c);
     if (!ares) return n;
     MYSQL_ROW arow;
     while ((arow = mysql_fetch_row(ares)) != NULL) {
@@ -410,13 +592,14 @@ int db_get_request_rows_by_status(const char *status, request_row_t *out, int ma
 }
 
 int db_get_request_rows_by_student(int roll_number, request_row_t *out, int max) {
-    if (out == NULL || max <= 0) return 0;
+    MYSQL *c = db_conn();
+    if (!c || out == NULL || max <= 0) return 0;
     char q[512];
     snprintf(q, sizeof(q), REQUEST_ROWS_SELECT
              "WHERE r.student_roll_number=%d ORDER BY r.request_number DESC",
              roll_number);
-    if (mysql_query(db, q) != 0) return -1;
-    MYSQL_RES *res = mysql_store_result(db);
+    if (mysql_query(c, q) != 0) return -1;
+    MYSQL_RES *res = mysql_store_result(c);
     if (!res) return -1;
     int n = 0;
     MYSQL_ROW row;
@@ -424,9 +607,9 @@ int db_get_request_rows_by_student(int roll_number, request_row_t *out, int max)
         fill_request_row(&out[n++], row);
     mysql_free_result(res);
 
-    if (mysql_query(db, "SELECT request_number,bus_number FROM bus_assignments") != 0)
+    if (mysql_query(c, "SELECT request_number,bus_number FROM bus_assignments") != 0)
         return n;
-    MYSQL_RES *ares = mysql_store_result(db);
+    MYSQL_RES *ares = mysql_store_result(c);
     if (!ares) return n;
     MYSQL_ROW arow;
     while ((arow = mysql_fetch_row(ares)) != NULL) {
@@ -441,13 +624,14 @@ int db_get_request_rows_by_student(int roll_number, request_row_t *out, int max)
 }
 
 int db_get_request_status(int request_number, char *out, size_t outsz) {
-    if (out == NULL || outsz == 0) return 0;
+    MYSQL *c = db_conn();
+    if (!c || out == NULL || outsz == 0) return 0;
     out[0] = '\0';
     char q[128];
     snprintf(q, sizeof(q), "SELECT status FROM pickup_requests WHERE request_number=%d",
              request_number);
-    if (mysql_query(db, q) != 0) return 0;
-    MYSQL_RES *res = mysql_store_result(db);
+    if (mysql_query(c, q) != 0) return 0;
+    MYSQL_RES *res = mysql_store_result(c);
     if (!res) return 0;
     MYSQL_ROW row = mysql_fetch_row(res);
     int ok = 0;
@@ -460,61 +644,65 @@ int db_get_request_status(int request_number, char *out, size_t outsz) {
 }
 
 int db_count_buses(void) {
-    if (mysql_query(db, "SELECT COUNT(*) FROM buses") != 0) return -1;
-    MYSQL_RES *res = mysql_store_result(db);
+    MYSQL *c = db_conn();
+    if (!c) return -1;
+    if (mysql_query(c, "SELECT COUNT(*) FROM buses") != 0) return -1;
+    MYSQL_RES *res = mysql_store_result(c);
     if (!res) return -1;
     MYSQL_ROW row = mysql_fetch_row(res);
-    int c = (row && row[0]) ? atoi(row[0]) : 0;
+    int cr = (row && row[0]) ? atoi(row[0]) : 0;
     mysql_free_result(res);
-    return c;
+    return cr;
 }
 
 int db_register_bus(int route_pickup, int route_dropoff, int max_capacity) {
+    MYSQL *c = db_conn();
+    if (!c) return 0;
     int bn = 1;
-    if (mysql_query(db,"SELECT COALESCE(MAX(bus_number),0)+1 FROM buses")==0) {
-        MYSQL_RES *r=mysql_store_result(db); if(r){MYSQL_ROW row=mysql_fetch_row(r); if(row&&row[0])bn=atoi(row[0]); mysql_free_result(r);}
+    if (mysql_query(c,"SELECT COALESCE(MAX(bus_number),0)+1 FROM buses")==0) {
+        MYSQL_RES *r=mysql_store_result(c); if(r){MYSQL_ROW row=mysql_fetch_row(r); if(row&&row[0])bn=atoi(row[0]); mysql_free_result(r);}
     }
     char q[256];
     snprintf(q,sizeof(q),
         "INSERT INTO buses (bus_number,route_pickup,route_dropoff,current_count,max_capacity) "
         "VALUES (%d,%d,%d,0,%d)", bn, route_pickup, route_dropoff, max_capacity);
-    if (mysql_query(db,q)!=0) { fprintf(stderr,"Register bus failed: %s\n",mysql_error(db)); return 0; }
+    if (mysql_query(c,q)!=0) { fprintf(stderr,"Register bus failed: %s\n",mysql_error(c)); return 0; }
     char *loc[]={"JUIT","Ravli PG","Peach Tree","Waknaghat"};
     printf("\nBus %d registered: %s -> %s (Capacity: %d)\n", bn, loc[route_pickup], loc[route_dropoff], max_capacity);
     return bn;
 }
 
 int db_update_bus_count(int bus_number, int delta) {
+    MYSQL *c = db_conn();
+    if (!c) return 0;
     char q[256];
     snprintf(q,sizeof(q),"UPDATE buses SET current_count=current_count+%d WHERE bus_number=%d AND current_count+%d>=0",delta,bus_number,delta);
-    if (mysql_query(db,q)!=0) return 0;
-    return mysql_affected_rows(db)>0 ? 1 : 0;
+    if (mysql_query(c,q)!=0) return 0;
+    return mysql_affected_rows(c)>0 ? 1 : 0;
 }
 
 // ============================================================
 // ASSIGNMENTS
 // ============================================================
 
-// Atomically place one request on a bus: the capacity-guarded UPDATE and the
-// assignment INSERT succeed or fail together inside one transaction.
 int db_assign_request_to_bus(int request_number, int bus_number) {
+    MYSQL *c = db_conn();
+    if (!c) return 0;
     if (!db_begin()) return 0;
 
-    // Guarded increment: only takes a seat if the bus still has one, so two
-    // concurrent runs can never overfill the same bus.
     char q[512];
     snprintf(q, sizeof(q),
         "UPDATE buses SET current_count=current_count+1 "
         "WHERE bus_number=%d AND current_count<max_capacity", bus_number);
-    if (mysql_query(db, q) != 0 || mysql_affected_rows(db) != 1) {
-        db_rollback(); return 0;               // bus full or unknown
+    if (mysql_query(c, q) != 0 || mysql_affected_rows(c) != 1) {
+        db_rollback(); return 0;
     }
 
     snprintf(q, sizeof(q),
         "INSERT INTO bus_assignments (request_number,bus_number) VALUES (%d,%d)",
         request_number, bus_number);
-    if (mysql_query(db, q) != 0) {
-        db_rollback(); return 0;               // duplicate assignment, FK issue, ...
+    if (mysql_query(c, q) != 0) {
+        db_rollback(); return 0;
     }
 
     if (!db_commit()) { db_rollback(); return 0; }
@@ -522,22 +710,26 @@ int db_assign_request_to_bus(int request_number, int bus_number) {
 }
 
 int db_is_request_assigned(int request_number) {
+    MYSQL *c = db_conn();
+    if (!c) return 0;
     char q[256];
     snprintf(q,sizeof(q),"SELECT COUNT(*) FROM bus_assignments WHERE request_number=%d",request_number);
-    if (mysql_query(db,q)!=0) return 0;
-    MYSQL_RES *r=mysql_store_result(db); if(!r) return 0;
+    if (mysql_query(c,q)!=0) return 0;
+    MYSQL_RES *r=mysql_store_result(c); if(!r) return 0;
     MYSQL_ROW row=mysql_fetch_row(r);
-    int c=(row&&row[0])?atoi(row[0]):0;
-    mysql_free_result(r); return c>0;
+    int cr=(row&&row[0])?atoi(row[0]):0;
+    mysql_free_result(r); return cr>0;
 }
 
 int db_unassign_request(int request_number) {
+    MYSQL *c = db_conn();
+    if (!c) return 0;
     if (!db_begin()) return 0;
 
     char q[256]; int bn = 0;
     snprintf(q, sizeof(q), "SELECT bus_number FROM bus_assignments WHERE request_number=%d", request_number);
-    if (mysql_query(db, q) != 0) { db_rollback(); return 0; }
-    MYSQL_RES *r = mysql_store_result(db);
+    if (mysql_query(c, q) != 0) { db_rollback(); return 0; }
+    MYSQL_RES *r = mysql_store_result(c);
     if (!r) { db_rollback(); return 0; }
     MYSQL_ROW row = mysql_fetch_row(r);
     if (row && row[0]) bn = atoi(row[0]);
@@ -545,10 +737,10 @@ int db_unassign_request(int request_number) {
     if (bn == 0) { db_rollback(); printf("\nRequest %d is not assigned.\n", request_number); return 0; }
 
     snprintf(q, sizeof(q), "DELETE FROM bus_assignments WHERE request_number=%d", request_number);
-    if (mysql_query(db, q) != 0) { db_rollback(); return 0; }
+    if (mysql_query(c, q) != 0) { db_rollback(); return 0; }
 
     snprintf(q, sizeof(q), "UPDATE buses SET current_count=current_count-1 WHERE bus_number=%d AND current_count>0", bn);
-    if (mysql_query(db, q) != 0) { db_rollback(); return 0; }
+    if (mysql_query(c, q) != 0) { db_rollback(); return 0; }
 
     if (!db_commit()) { db_rollback(); return 0; }
     printf("\nRequest %d unassigned from bus %d.\n", request_number, bn);
@@ -560,17 +752,17 @@ int db_unassign_request(int request_number) {
 // ============================================================
 
 int db_verify_role_password(const char *role, const char *password) {
-    if (!role || !password) return 0;
+    MYSQL *c = db_conn();
+    if (!role || !password || !c) return 0;
     char erole[80]; char q[256];
     db_escape(role, erole, sizeof(erole));
     snprintf(q, sizeof(q), "SELECT password FROM credentials WHERE role='%s'", erole);
-    if (mysql_query(db, q) != 0) return 0;
-    MYSQL_RES *r = mysql_store_result(db); if (!r) return 0;
+    if (mysql_query(c, q) != 0) return 0;
+    MYSQL_RES *r = mysql_store_result(c); if (!r) return 0;
     MYSQL_ROW row = mysql_fetch_row(r);
     int ok = 0;
     if (row && row[0]) {
         ok = pw_verify(password, row[0]);
-        // Legacy plaintext default creds: re-hash on first successful login.
         if (ok && strncmp(row[0], "pbkdf2-sha256$", 14) != 0) {
             char hashed[PW_HASH_STORAGE_LEN];
             char ehashed[256];
@@ -579,7 +771,7 @@ int db_verify_role_password(const char *role, const char *password) {
                 char uq[512];
                 snprintf(uq, sizeof(uq), "UPDATE credentials SET password='%s' WHERE role='%s'",
                          ehashed, erole);
-                mysql_query(db, uq);
+                mysql_query(c, uq);
             }
         }
     }
@@ -587,11 +779,13 @@ int db_verify_role_password(const char *role, const char *password) {
 }
 
 void db_create_default_credentials(void) {
-    if (mysql_query(db, "SELECT COUNT(*) FROM credentials") != 0) return;
-    MYSQL_RES *r = mysql_store_result(db); if (!r) return;
+    MYSQL *c = db_conn();
+    if (!c) return;
+    if (mysql_query(c, "SELECT COUNT(*) FROM credentials") != 0) return;
+    MYSQL_RES *r = mysql_store_result(c); if (!r) return;
     MYSQL_ROW row = mysql_fetch_row(r);
-    int c = (row && row[0]) ? atoi(row[0]) : 0;
-    mysql_free_result(r); if (c > 0) return;
+    int cr = (row && row[0]) ? atoi(row[0]) : 0;
+    mysql_free_result(r); if (cr > 0) return;
 
     char g[PW_HASH_STORAGE_LEN], s[PW_HASH_STORAGE_LEN], eg[256], es[256];
     if (pw_hash("guard123", g, sizeof(g)) && pw_hash("scheduler123", s, sizeof(s)) &&
@@ -600,7 +794,7 @@ void db_create_default_credentials(void) {
         snprintf(q, sizeof(q),
             "INSERT INTO credentials (role,password) VALUES ('guard','%s'),('scheduler','%s')",
             eg, es);
-        mysql_query(db, q);
+        mysql_query(c, q);
     }
     printf("\n[INFO] Default credentials: guard/guard123, scheduler/scheduler123\n");
 }
@@ -610,12 +804,14 @@ void db_create_default_credentials(void) {
 // ============================================================
 
 void db_migrate_from_text_files(void) {
-    if (mysql_query(db,"SELECT COUNT(*) FROM students")!=0) return;
-    MYSQL_RES *r=mysql_store_result(db); if(!r) return;
+    MYSQL *c = db_conn();
+    if (!c) return;
+    if (mysql_query(c,"SELECT COUNT(*) FROM students")!=0) return;
+    MYSQL_RES *r=mysql_store_result(c); if(!r) return;
     MYSQL_ROW row=mysql_fetch_row(r);
-    int c=(row&&row[0])?atoi(row[0]):0;
+    int cr=(row&&row[0])?atoi(row[0]):0;
     mysql_free_result(r);
-    if (c>0) { printf("\n[INFO] Database has data. Skipping migration.\n"); return; }
+    if (cr>0) { printf("\n[INFO] Database has data. Skipping migration.\n"); return; }
 
     printf("\n[INFO] Migrating text files to MySQL...\n");
     FILE *f=fopen("studentregistration.txt","r");
@@ -648,13 +844,12 @@ void db_migrate_from_text_files(void) {
             int pl=-1,dl=-1;
             if(strcmp(p,"JUIT")==0)pl=0;else if(strcmp(p,"Ravli PG")==0)pl=1;else if(strcmp(p,"Peach Tree")==0)pl=2;else if(strcmp(p,"Waknaghat")==0)pl=3;
             if(strcmp(d,"JUIT")==0)dl=0;else if(strcmp(d,"Ravli PG")==0)dl=1;else if(strcmp(d,"Peach Tree")==0)dl=2;else if(strcmp(d,"Waknaghat")==0)dl=3;
-            // Legacy file text is untrusted — escape before splicing into SQL.
             char ep[70], ed[70];
             db_escape(p, ep, sizeof(ep));
             db_escape(d, ed, sizeof(ed));
             char q[512];
             snprintf(q,sizeof(q),"INSERT IGNORE INTO pickup_requests (request_number,student_roll_number,pickup_place,dropoff_place,pickup_location,dropoff_location,direction,status) VALUES (%d,%d,'%s','%s',%d,%d,0,'%s')",rn,roll,ep,ed,pl,dl,files[i].s);
-            mysql_query(db,q);
+            mysql_query(c,q);
         }
         fclose(f); printf("  [OK] %s requests migrated\n",files[i].s);
     }
@@ -666,8 +861,10 @@ void db_migrate_from_text_files(void) {
 // ============================================================
 
 int db_view_bus_schedule(void) {
-    if (mysql_query(db,"SELECT bus_number,route_pickup,route_dropoff,current_count,max_capacity FROM buses ORDER BY bus_number")!=0) return 0;
-    MYSQL_RES *r=mysql_store_result(db); if(!r) return 0;
+    MYSQL *c = db_conn();
+    if (!c) return 0;
+    if (mysql_query(c,"SELECT bus_number,route_pickup,route_dropoff,current_count,max_capacity FROM buses ORDER BY bus_number")!=0) return 0;
+    MYSQL_RES *r=mysql_store_result(c); if(!r) return 0;
     char *loc[]={"JUIT","Ravli PG","Peach Tree","Waknaghat"};
     printf("\n===== BUS SCHEDULE =====\n");
     int count=0; MYSQL_ROW row;
@@ -678,8 +875,8 @@ int db_view_bus_schedule(void) {
 
         char aq[512];
         snprintf(aq,sizeof(aq),"SELECT r.request_number,s.name,s.roll_number,r.pickup_place,r.dropoff_place FROM bus_assignments ba JOIN pickup_requests r ON ba.request_number=r.request_number JOIN students s ON r.student_roll_number=s.roll_number WHERE ba.bus_number=%d",bn);
-        if(mysql_query(db,aq)==0){
-            MYSQL_RES *ar=mysql_store_result(db); if(ar){int has=0;MYSQL_ROW ar2;
+        if(mysql_query(c,aq)==0){
+            MYSQL_RES *ar=mysql_store_result(c); if(ar){int has=0;MYSQL_ROW ar2;
             while((ar2=mysql_fetch_row(ar))){if(!has){printf("\nAssigned:");has=1;}
             printf("\n  - [%d] %s (Roll: %d) | %s -> %s",atoi(ar2[0]),ar2[1]?ar2[1]:"",atoi(ar2[2]),ar2[3]?ar2[3]:"",ar2[4]?ar2[4]:"");}
             mysql_free_result(ar);}
@@ -691,8 +888,10 @@ int db_view_bus_schedule(void) {
 }
 
 int db_view_route_capacity(void) {
-    if (mysql_query(db,"SELECT route_pickup,route_dropoff,SUM(max_capacity),SUM(current_count),COUNT(*) FROM buses GROUP BY route_pickup,route_dropoff")!=0) return 0;
-    MYSQL_RES *r=mysql_store_result(db); if(!r) return 0;
+    MYSQL *c = db_conn();
+    if (!c) return 0;
+    if (mysql_query(c,"SELECT route_pickup,route_dropoff,SUM(max_capacity),SUM(current_count),COUNT(*) FROM buses GROUP BY route_pickup,route_dropoff")!=0) return 0;
+    MYSQL_RES *r=mysql_store_result(c); if(!r) return 0;
     char *loc[]={"JUIT","Ravli PG","Peach Tree","Waknaghat"};
     printf("\n===== ROUTE CAPACITY SUMMARY =====\n");
     int count=0; MYSQL_ROW row;

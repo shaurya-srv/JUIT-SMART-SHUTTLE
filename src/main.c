@@ -127,8 +127,15 @@ int main(void) {
         return 1;
     }
 
+    // CLI is single-threaded: pool of 1 is enough.
+    db_pool_init(1);
+    db_pool_acquire();       // sets TLS so db_conn() works
+
     db_migrate_from_text_files();
     loginPage();
+
+    db_pool_release();
+    db_pool_shutdown();
     db_close();
     return 0;
 }
