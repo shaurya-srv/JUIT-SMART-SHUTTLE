@@ -1,16 +1,10 @@
 {
   "version": 2,
   "public": true,
-  "builds": [
+  "rewrites": [
     {
-      "src": "server/server.js",
-      "use": "@vercel/node"
-    }
-  ],
-  "routes": [
-    {
-      "src": "^/api/(.*)",
-      "dest": "server/server.js"
+      "source": "/api/:path*",
+      "destination": "/api/index.js"
     }
   ]
 }
