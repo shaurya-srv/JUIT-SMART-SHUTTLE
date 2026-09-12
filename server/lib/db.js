@@ -3,12 +3,17 @@
 
 const { Pool } = require('pg');
 
+const host = process.env.SHUTTLE_DB_HOST || '127.0.0.1';
+const isLocal = host === '127.0.0.1' || host === 'localhost';
+
 const pool = new Pool({
-  host:     process.env.SHUTTLE_DB_HOST || '127.0.0.1',
+  host,
   user:     process.env.SHUTTLE_DB_USER || 'postgres',
   password: process.env.SHUTTLE_DB_PASS,
   database: process.env.SHUTTLE_DB_NAME || 'shuttle_db',
   port:     parseInt(process.env.SHUTTLE_DB_PORT || '5432'),
+  // Hosted Postgres (Supabase) requires TLS; local dev does not.
+  ssl: isLocal ? false : { rejectUnauthorized: false },
   max:      10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
