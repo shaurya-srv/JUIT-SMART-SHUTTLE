@@ -20,6 +20,11 @@ const JWT_SECRET = process.env.JWT_SECRET || require('crypto').randomBytes(32).t
 app.use(cors());
 app.use(express.json({ limit: '4kb' }));
 
+// Express 4 does not catch rejected promises from async handlers — an unhandled
+// rejection kills the process (fatal on Vercel serverless). Wrap every async
+// route so errors fall through to the error middleware as a clean 500 instead.
+const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 // Note: On Vercel, static files (index.html) are served by Vercel's routing.
 // The express.static middleware is only used for local development.
 
@@ -54,16 +59,16 @@ function requireRole(...roles) {
 // Public endpoints
 // ============================================================
 
-app.get('/api/health', async (req, res) => {
+app.get('/api/health', ah(async (req, res) => {
   try {
     await db.query('SELECT 1');
     res.json({ status: 'ok', database: 'up' });
   } catch {
     res.json({ status: 'ok', database: 'down' });
   }
-});
+}));
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', ah(async (req, res) => {
   const { role, password, roll_number } = req.body;
   if (!role || !password) {
     return res.status(400).json({ error: 'role and password are required' });
@@ -102,9 +107,9 @@ app.post('/api/login', async (req, res) => {
   }
 
   return res.status(400).json({ error: 'unknown role' });
-});
+}));
 
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', ah(async (req, res) => {
   const { roll_number, name, room, hostel, phone, password } = req.body;
   if (!roll_number || !name || !room || !hostel || !phone || !password) {
     return res.status(400).json({ error: 'roll_number, name, room, hostel, phone and password are required' });
@@ -121,9 +126,9 @@ app.post('/api/register', async (req, res) => {
     'INSERT INTO students (name, roll_number, room_number, hostel_name, phone_number, password) VALUES ($1,$2,$3,$4,$5,$6)',
     [name, roll_number, room, hostel, phone, hashed]);
   res.status(201).json({ registered: true });
-});
+}));
 
-app.post('/api/reset-password', async (req, res) => {
+app.post('/api/reset-password', ah(async (req, res) => {
   const { roll_number, new_password } = req.body;
   if (!roll_number || !new_password) {
     return res.status(400).json({ error: 'roll_number and new_password are required' });
@@ -138,13 +143,13 @@ app.post('/api/reset-password', async (req, res) => {
   const hashed = pwHash(new_password);
   await db.query('UPDATE students SET password = $1 WHERE roll_number = $2', [hashed, roll_number]);
   res.json({ reset: true });
-});
+}));
 
 // ============================================================
 // Authenticated endpoints
 // ============================================================
 
-app.post('/api/requests', authenticate, requireRole('student'), async (req, res) => {
+app.post('/api/requests', authenticate, requireRole('student'), ah(async (req, res) => {
   const { pickup_place, dropoff_place } = req.body;
   if (!pickup_place || !dropoff_place) {
     return res.status(400).json({ error: 'pickup_place and dropoff_place are required' });
@@ -173,9 +178,9 @@ app.post('/api/requests', authenticate, requireRole('student'), async (req, res)
   } finally {
     conn.release();
   }
-});
+}));
 
-app.get('/api/requests/mine', authenticate, requireRole('student'), async (req, res) => {
+app.get('/api/requests/mine', authenticate, requireRole('student'), ah(async (req, res) => {
   const [rows] = await db.query(
     'SELECT r.request_number, s.name AS student_name, s.roll_number AS student_roll_number, '
     + 's.hostel_name, s.room_number, s.phone_number, r.pickup_place, r.dropoff_place, r.status '
@@ -201,9 +206,9 @@ app.get('/api/requests/mine', authenticate, requireRole('student'), async (req, 
   }));
 
   res.json({ count: result.length, requests: result });
-});
+}));
 
-app.get('/api/requests', authenticate, requireRole('guard', 'scheduler'), async (req, res) => {
+app.get('/api/requests', authenticate, requireRole('guard', 'scheduler'), ah(async (req, res) => {
   let query = 'SELECT r.request_number, s.name AS student_name, s.roll_number AS student_roll_number, '
     + 's.hostel_name, s.room_number, s.phone_number, r.pickup_place, r.dropoff_place, r.status '
     + 'FROM pickup_requests r JOIN students s ON r.student_roll_number = s.roll_number';
@@ -239,9 +244,9 @@ app.get('/api/requests', authenticate, requireRole('guard', 'scheduler'), async 
   }));
 
   res.json({ count: result.length, requests: result });
-});
+}));
 
-app.post('/api/requests/:id/approve', authenticate, requireRole('guard'), async (req, res) => {
+app.post('/api/requests/:id/approve', authenticate, requireRole('guard'), ah(async (req, res) => {
   const id = parseInt(req.params.id);
   const ok = await coreApproveRequest(id);
   if (!ok) {
@@ -250,9 +255,9 @@ app.post('/api/requests/:id/approve', authenticate, requireRole('guard'), async 
     return res.status(409).json({ error: 'request is not pending' });
   }
   res.json({ request_number: id, status: 'APPROVED' });
-});
+}));
 
-app.post('/api/requests/:id/reject', authenticate, requireRole('guard'), async (req, res) => {
+app.post('/api/requests/:id/reject', authenticate, requireRole('guard'), ah(async (req, res) => {
   const id = parseInt(req.params.id);
   const ok = await coreRejectRequest(id);
   if (!ok) {
@@ -261,9 +266,9 @@ app.post('/api/requests/:id/reject', authenticate, requireRole('guard'), async (
     return res.status(409).json({ error: 'request is not pending' });
   }
   res.json({ request_number: id, status: 'REJECTED' });
-});
+}));
 
-app.get('/api/buses', authenticate, requireRole('scheduler'), async (req, res) => {
+app.get('/api/buses', authenticate, requireRole('scheduler'), ah(async (req, res) => {
   const [rows] = await db.query('SELECT * FROM buses ORDER BY bus_number');
   const result = rows.map(b => ({
     bus_number: b.bus_number,
@@ -274,9 +279,9 @@ app.get('/api/buses', authenticate, requireRole('scheduler'), async (req, res) =
     capacity: b.max_capacity,
   }));
   res.json({ count: result.length, buses: result });
-});
+}));
 
-app.post('/api/buses', authenticate, requireRole('scheduler'), async (req, res) => {
+app.post('/api/buses', authenticate, requireRole('scheduler'), ah(async (req, res) => {
   const { route_pickup, route_dropoff, max_capacity } = req.body;
   if (route_pickup == null || route_dropoff == null || max_capacity == null) {
     return res.status(400).json({ error: 'route_pickup, route_dropoff and max_capacity are required' });
@@ -295,18 +300,18 @@ app.post('/api/buses', authenticate, requireRole('scheduler'), async (req, res) 
   res.status(201).json({
     bus_number: bn, route_pickup, route_dropoff, max_capacity,
   });
-});
+}));
 
-app.post('/api/buses/assign', authenticate, requireRole('scheduler'), async (req, res) => {
+app.post('/api/buses/assign', authenticate, requireRole('scheduler'), ah(async (req, res) => {
   try {
     const result = await coreAssignApprovedRequests();
     res.json(result);
   } catch {
     res.status(500).json({ error: 'database error during assignment' });
   }
-});
+}));
 
-app.post('/api/assignments/unassign', authenticate, requireRole('scheduler'), async (req, res) => {
+app.post('/api/assignments/unassign', authenticate, requireRole('scheduler'), ah(async (req, res) => {
   const { request_number } = req.body;
   if (!request_number) {
     return res.status(400).json({ error: 'request_number is required' });
@@ -334,9 +339,9 @@ app.post('/api/assignments/unassign', authenticate, requireRole('scheduler'), as
   } finally {
     conn.release();
   }
-});
+}));
 
-app.get('/api/reports/capacity', authenticate, requireRole('guard', 'scheduler'), async (req, res) => {
+app.get('/api/reports/capacity', authenticate, requireRole('guard', 'scheduler'), ah(async (req, res) => {
   const [rows] = await db.query(
     'SELECT route_pickup, route_dropoff, SUM(max_capacity)::int AS capacity, '
     + 'SUM(current_count)::int AS assigned, COUNT(*)::int AS buses '
@@ -351,6 +356,13 @@ app.get('/api/reports/capacity', authenticate, requireRole('guard', 'scheduler')
   }));
 
   res.json({ count: result.length, routes: result });
+}));
+
+// Central error handler — target of the ah() wrapper above.
+app.use((err, req, res, next) => {
+  console.error(`API error ${req.method} ${req.path}: ${err.message}`);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'internal server error' });
 });
 
 // ============================================================
