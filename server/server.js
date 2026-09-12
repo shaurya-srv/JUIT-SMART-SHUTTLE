@@ -20,8 +20,8 @@ const JWT_SECRET = process.env.JWT_SECRET || require('crypto').randomBytes(32).t
 app.use(cors());
 app.use(express.json({ limit: '4kb' }));
 
-// Serve static frontend
-app.use(express.static(__dirname + '/..'));
+// Note: On Vercel, static files (index.html) are served by Vercel's routing.
+// The express.static middleware is only used for local development.
 
 // ============================================================
 // Auth middleware
