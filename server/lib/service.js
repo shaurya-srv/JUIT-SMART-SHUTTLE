@@ -13,22 +13,22 @@ function coreRouteIsValid(p, d)     { return routeIsValid(p, d); }
 // Request lifecycle transitions
 async function coreApproveRequest(requestNumber) {
   const [rows] = await db.query(
-    'SELECT status FROM pickup_requests WHERE request_number = ?', [requestNumber]);
+    'SELECT status FROM pickup_requests WHERE request_number = $1', [requestNumber]);
   if (!rows.length || rows[0].status !== 'PENDING_APPROVAL') return false;
   const [result] = await db.query(
-    'UPDATE pickup_requests SET status = ? WHERE request_number = ?',
+    'UPDATE pickup_requests SET status = $1 WHERE request_number = $2',
     ['APPROVED', requestNumber]);
-  return result.affectedRows > 0;
+  return result > 0;
 }
 
 async function coreRejectRequest(requestNumber) {
   const [rows] = await db.query(
-    'SELECT status FROM pickup_requests WHERE request_number = ?', [requestNumber]);
+    'SELECT status FROM pickup_requests WHERE request_number = $1', [requestNumber]);
   if (!rows.length || rows[0].status !== 'PENDING_APPROVAL') return false;
   const [result] = await db.query(
-    'UPDATE pickup_requests SET status = ? WHERE request_number = ?',
+    'UPDATE pickup_requests SET status = $1 WHERE request_number = $2',
     ['REJECTED', requestNumber]);
-  return result.affectedRows > 0;
+  return result > 0;
 }
 
 // Bus assignment algorithm
@@ -50,12 +50,12 @@ async function coreAssignApprovedRequests() {
       + 'FROM buses ORDER BY bus_number');
     const [reqs] = await conn.query(
       'SELECT request_number, pickup_location, dropoff_location '
-      + 'FROM pickup_requests WHERE status = ? ORDER BY request_number', ['APPROVED']);
+      + 'FROM pickup_requests WHERE status = $1 ORDER BY request_number', ['APPROVED']);
 
     for (const req of reqs) {
       // Check if already assigned
       const [assigned] = await conn.query(
-        'SELECT COUNT(*) AS cnt FROM bus_assignments WHERE request_number = ?',
+        'SELECT COUNT(*)::int AS cnt FROM bus_assignments WHERE request_number = $1',
         [req.request_number]);
       if (assigned[0].cnt > 0) {
         result.skipped_already_assigned++;
@@ -71,12 +71,12 @@ async function coreAssignApprovedRequests() {
           // Atomic: capacity-guarded increment
           const [inc] = await conn.query(
             'UPDATE buses SET current_count = current_count + 1 '
-            + 'WHERE bus_number = ? AND current_count < max_capacity',
+            + 'WHERE bus_number = $1 AND current_count < max_capacity',
             [bus.bus_number]);
-          if (inc.affectedRows !== 1) continue;
+          if (inc !== 1) continue;
 
           await conn.query(
-            'INSERT INTO bus_assignments (request_number, bus_number) VALUES (?, ?)',
+            'INSERT INTO bus_assignments (request_number, bus_number) VALUES ($1, $2)',
             [req.request_number, bus.bus_number]);
 
           bus.current_count++;

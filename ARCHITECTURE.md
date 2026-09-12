@@ -1,19 +1,17 @@
 # JUIT Smart Shuttle — Architecture Plan
 
-> Status: **ALL PHASES COMPLETE** (2026-09-11). Web role: **C HTTP/JSON API**. Code layout: **split modules**.
-> All deferred items resolved: SQL escaping hardened, mingw32-make toolchain fixed.
+> Status: **ALL PHASES COMPLETE** (2026-09-12). Web role: **Node.js/Express API** on Vercel. Code layout: **split modules**.
+> C backend for local CLI; Node.js backend for Vercel deployment with PostgreSQL (Supabase).
 
 ## 1. Current state (what exists today)
 
 | Component | Location | State |
 |---|---|---|
-| CLI app (all portals + business logic) | `index.c` (~624 lines) | Works; menus, assignment algorithm, and DB calls are interleaved |
-| MySQL data-access layer | `database.c` / `database.h` | Works; schema creation, one-time text-file migration, all queries |
-| Web frontend | `index.html` (~800 lines) | Full duplicate of the domain in JS on `localStorage` — disconnected from real data |
-| Legacy text storage | `*.txt` data files | Obsolete; read once by the migration step |
-
-**Core problem:** business logic exists twice (C + JS) over two storage systems (MySQL + localStorage).
-Nothing connects the web UI to the real database.
+| CLI app (all portals + business logic) | `src/` (C, mingw32-make) | Complete; menus, assignment algorithm, business logic |
+| C HTTP/JSON API server | `src/api/` (C, winsock2) | Complete; local deployment, connection pool, logging |
+| Node.js API server | `server/` (Express.js) | Complete; Vercel deployment, JWT auth, PostgreSQL |
+| Web frontend | `index.html` | Calls Node.js API; auto-detects API URL |
+| Database | MySQL (local) / PostgreSQL (Supabase) | Dual-target: C uses MySQL, Node.js uses PostgreSQL |
 
 ## 2. Target architecture
 
@@ -183,18 +181,27 @@ shuttle/
 |---|---|---|
 | 2026-09-10 | Web served by a C HTTP API | One language end-to-end; reuses `core/` + `db/` directly |
 | 2026-09-10 | Split module layout (cli/core/db/api) | Testable business rules; CLI and API share one implementation |
-| 2026-09-10 | SQL escaping + make fix deferred | User asked to defer; plan does not depend on them |
 | 2026-09-11 | TLS-based connection pool over CRITICAL_SECTION | Enables true concurrency; each thread owns its connection |
 | 2026-09-11 | Mandatory SHUTTLE_DB_PASS | Security: no credentials in source code or binaries |
-| 2026-09-11 | Log to stderr with timestamps | Debuggability without polluting stdout |
+| 2026-09-12 | Node.js port for Vercel | Vercel can't run C binaries; Express.js + pg is serverless-friendly |
+| 2026-09-12 | PostgreSQL via Supabase | Free tier, managed hosting, no self-hosted MySQL needed |
+| 2026-09-12 | JWT instead of in-memory sessions | Stateless auth survives Vercel cold starts |
 
-## 6. Risks / notes
+## 6. Deployment targets
+
+| Target | Backend | Database | Auth |
+|---|---|---|---|
+| Local CLI | C (`shuttle.exe`) | MySQL/MariaDB | In-memory sessions |
+| Local API | C (`shuttle_api.exe`) | MySQL/MariaDB | CSPRNG tokens |
+| Vercel | Node.js (`server/server.js`) | PostgreSQL (Supabase) | JWT tokens |
+
+## 7. Risks / notes
 
 - ✅ ~~MySQL password currently hard-coded~~ — removed in Phase 5; `SHUTTLE_DB_PASS`
   env-var is mandatory.
 - ✅ ~~API server serialized under CRITICAL_SECTION~~ — replaced by connection pool
-  in Phase 5; 4 concurrent connections, verified with parallel requests.
-- `conio.h` (`getch`) is Windows-only — CLI stays Windows-only, which matches the
-  current environment; `api/` has no such dependency.
-- Sessions remain in-memory (lost on restart) — acceptable for single-machine
-  deployment; consider Redis/DB-backed sessions for multi-node scaling.
+  in Phase 5.
+- `conio.h` (`getch`) is Windows-only — CLI stays Windows-only.
+- Sessions remain in-memory for the C API; Node.js API uses JWT (stateless).
+- Node.js backend uses PostgreSQL (`pg`); C backend uses MySQL (`libmariadb`).
+  Schema differences noted in `server/supabase-schema.sql`.

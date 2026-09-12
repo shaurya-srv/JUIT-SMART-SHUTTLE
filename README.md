@@ -1,6 +1,6 @@
 # JUIT Smart Shuttle
 
-A C-based smart hostel shuttle request and verification system designed to improve transportation between JUIT Solan's campus and its off-campus hostels. Data is persisted in **MySQL/MariaDB** (replacing the original text-file storage).
+A smart hostel shuttle request and verification system designed to improve transportation between JUIT Solan's campus and its off-campus hostels. Data is persisted in **MySQL/MariaDB** (local) or **PostgreSQL via Supabase** (Vercel deployment).
 
 ## Overview
 
@@ -38,8 +38,7 @@ REJECTED
 
 ## HTTP/JSON API (web)
 
-`index.html` is a browser client for the same workflow — it calls a small HTTP/JSON
-server built from the same `core/` and `db/` layers:
+### Local deployment (C server)
 
 ```bash
 export SHUTTLE_DB_PASS=yourpassword   # required
@@ -47,15 +46,34 @@ make api       # builds shuttle_api.exe
 ./shuttle_api.exe   # listens on 127.0.0.1:8080 (loopback only)
 ```
 
-Then open `index.html` in a browser. The server uses a **connection pool** (4
-concurrent MySQL connections by default) so multiple browser tabs and API calls
-are handled in parallel. Structured request logs (timestamp, method, path,
-status, duration) are written to stderr.
+### Vercel deployment (Node.js server)
 
-Endpoints: `/api/health`, `/api/login`,
-`/api/register`, `/api/requests` (+ `/mine`, `/{id}/approve`, `/{id}/reject`),
-`/api/buses`, `/api/buses/assign`, `/api/assignments/unassign`,
-`/api/reports/capacity`.
+```bash
+cd server
+npm install
+SHUTTLE_DB_PASS=yourpassword node server.js
+```
+
+### Environment variables for Vercel
+
+Set these in the Vercel dashboard (Settings → Environment Variables):
+
+| Variable | Value | Description |
+|---|---|---|
+| `SHUTTLE_DB_HOST` | Your Supabase database host | e.g., `db.xxxxx.supabase.co` |
+| `SHUTTLE_DB_USER` | Your Supabase database user | e.g., `postgres` |
+| `SHUTTLE_DB_PASS` | Your Supabase database password | Found in Supabase dashboard |
+| `SHUTTLE_DB_NAME` | `postgres` | Supabase default database |
+| `SHUTTLE_DB_PORT` | `5432` | PostgreSQL port |
+| `JWT_SECRET` | A strong random string | For signing JWT tokens |
+
+### Setting up Supabase
+
+1. Create a free account at [supabase.com](https://supabase.com)
+2. Create a new project
+3. Go to **Settings** → **Database** → copy the connection details
+4. Open the **SQL Editor** and paste the contents of `server/supabase-schema.sql`
+5. Copy the connection details into your Vercel environment variables
 
 ## Security
 
@@ -63,17 +81,15 @@ Endpoints: `/api/health`, `/api/login`,
   required — both CLI and API server refuse to start without it. No passwords
   are compiled into the binaries.
 - **Passwords** are never stored in plaintext: PBKDF2-HMAC-SHA256, 60,000
-  iterations, per-user random 16-byte salt (Windows CNG). Legacy plaintext rows
+  iterations, per-user random 16-byte salt. Legacy plaintext rows
   from the text-file migration upgrade automatically on the first successful
-  login. Portal passwords seeded on first run (`guard123`, `scheduler123`) are
-  hashed like any other — change them via the app.
-- **Session tokens** are 128-bit CSPRNG values with an 8-hour sliding expiry.
-- **All user strings** are escaped with `mysql_real_escape_string` before they
-  reach SQL; request statuses are validated against a whitelist at the API layer.
+  login.
+- **JWT tokens** (Vercel) or **CSPRNG session tokens** (local) with 8-hour expiry.
+- **Parameterized queries** prevent SQL injection in both C (mysql_real_escape_string)
+  and Node.js ($1 placeholders with pg).
 - **Assignments are atomic**: seat count and assignment row change together in a
-  transaction with a capacity guard, so concurrent assignment runs cannot
-  overfill a bus.
-- **Connection pool**: each API thread gets its own MySQL connection from a pool,
+  transaction with a capacity guard.
+- **Connection pool**: each API thread/connection gets its own database connection,
   eliminating serialization and enabling true concurrent request handling.
 
 ## Database Schema
@@ -86,7 +102,7 @@ Endpoints: `/api/health`, `/api/login`,
 | `buses` | Registered buses with route and capacity |
 | `bus_assignments` | Request-to-bus mapping (one assignment per request) |
 
-## Tests
+## Tests (C backend)
 
 ```bash
 make test          # core: assignment algorithm + lifecycle transitions (10 tests)
@@ -137,6 +153,15 @@ src/
   core/             — business rules (assignment, lifecycle, locations) + crypto
   db/               — MySQL data-access layer (the only place that speaks SQL)
   api/              — HTTP/JSON server (winsock2) for the web frontend
+server/
+  server.js         — Express.js API server (Vercel deployment)
+  lib/
+    db.js           — PostgreSQL connection pool (pg)
+    crypto.js       — PBKDF2 hashing + CSPRNG (Node.js crypto)
+    service.js      — Business logic (mirrors src/core/service.c)
+    models.js       — Location constants and route validation
+  supabase-schema.sql — Database schema for Supabase
+  vercel.json       — Vercel deployment configuration
 tests/              — unit tests (in-memory db stub, no MySQL needed)
 index.html          — web frontend (calls the API)
 ARCHITECTURE.md     — design decisions and phased plan
