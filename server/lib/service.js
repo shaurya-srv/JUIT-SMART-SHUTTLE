@@ -15,20 +15,21 @@ async function coreApproveRequest(requestNumber) {
   const [rows] = await db.query(
     'SELECT status FROM pickup_requests WHERE request_number = $1', [requestNumber]);
   if (!rows.length || rows[0].status !== 'PENDING_APPROVAL') return false;
-  const [result] = await db.query(
+  // db.query returns [rows, rowCount]; for UPDATE the rowCount is what matters.
+  const [, rowCount] = await db.query(
     'UPDATE pickup_requests SET status = $1 WHERE request_number = $2',
     ['APPROVED', requestNumber]);
-  return result > 0;
+  return rowCount > 0;
 }
 
 async function coreRejectRequest(requestNumber) {
   const [rows] = await db.query(
     'SELECT status FROM pickup_requests WHERE request_number = $1', [requestNumber]);
   if (!rows.length || rows[0].status !== 'PENDING_APPROVAL') return false;
-  const [result] = await db.query(
+  const [, rowCount] = await db.query(
     'UPDATE pickup_requests SET status = $1 WHERE request_number = $2',
     ['REJECTED', requestNumber]);
-  return result > 0;
+  return rowCount > 0;
 }
 
 // Bus assignment algorithm
@@ -68,12 +69,12 @@ async function coreAssignApprovedRequests() {
             bus.route_dropoff === req.dropoff_location &&
             bus.current_count < bus.max_capacity) {
 
-          // Atomic: capacity-guarded increment
-          const [inc] = await conn.query(
+          // Atomic: capacity-guarded increment. conn.query returns [rows, rowCount].
+          const [, incCount] = await conn.query(
             'UPDATE buses SET current_count = current_count + 1 '
             + 'WHERE bus_number = $1 AND current_count < max_capacity',
             [bus.bus_number]);
-          if (inc !== 1) continue;
+          if (incCount !== 1) continue;
 
           await conn.query(
             'INSERT INTO bus_assignments (request_number, bus_number) VALUES ($1, $2)',
