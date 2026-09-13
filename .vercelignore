@@ -1,0 +1,16 @@
+# Large local junk that must never be uploaded to Vercel
+msys2-installer.exe
+libmariadb.dll
+mysql_import.a
+mysql_include/
+src/
+build/
+Makefile
+*.o
+*.db
+
+# Local-only files
+node_modules/
+.freebuff/
+.env*
+*.txt
