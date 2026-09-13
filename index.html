@@ -292,7 +292,7 @@ const API = window.location.port === '8080'
 // non-2xx using the API's {"error":"..."} body.
 async function apiCall(method, path, body, auth = false) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 8000);
+  const timer = setTimeout(() => ctrl.abort(), 25000);
   try {
     const res = await fetch(API + path, {
       method,
@@ -309,7 +309,7 @@ async function apiCall(method, path, body, auth = false) {
     if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
     return data;
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error('Request timed out. Is shuttle_api.exe running?');
+    if (e.name === 'AbortError') throw new Error('Server took too long to respond. The first request after a quiet period can be slow — please try again.');
     throw e;
   } finally {
     clearTimeout(timer);
