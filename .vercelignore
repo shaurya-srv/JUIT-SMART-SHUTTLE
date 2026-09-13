@@ -1,4 +1,5 @@
 # Large local junk that must never be uploaded to Vercel
+legacy/
 msys2-installer.exe
 libmariadb.dll
 mysql_import.a
