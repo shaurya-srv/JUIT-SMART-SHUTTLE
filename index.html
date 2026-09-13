@@ -183,6 +183,7 @@
   .badge-pending { background: #fef7e0; color: #b06000; }
   .badge-approved { background: #e6f4ea; color: #137333; }
   .badge-rejected { background: #fce8e6; color: #c5221f; }
+  .badge-completed { background: #e0e0e0; color: #3c4043; }
   .badge-full { background: var(--danger); color: #fff; }
   .badge-warn { background: var(--warn); color: #333; }
   .capacity-bar {
@@ -326,8 +327,10 @@ function saveSession() { localStorage.setItem('jss_session', JSON.stringify(sess
 function clearSession() { localStorage.removeItem('jss_session'); session = null; window.API_TOKEN = null; }
 window.API_TOKEN = session ? session.token : null;
 
-const badge = (status) =>
-  `<span class="badge badge-${status === 'APPROVED' ? 'approved' : status === 'REJECTED' ? 'rejected' : 'pending'}">${status.replace('_',' ')}</span>`;
+const badge = (status) => {
+  const cls = status === 'APPROVED' ? 'approved' : status === 'REJECTED' ? 'rejected' : status === 'COMPLETED' ? 'completed' : 'pending';
+  return `<span class="badge badge-${cls}">${status.replace('_',' ')}</span>`;
+};
 
 // ============================================================
 // RENDERING
@@ -347,6 +350,7 @@ function showLogin() {
         <option value="student">Student</option>
         <option value="guard">Guard</option>
         <option value="scheduler">Bus Scheduler</option>
+        <option value="admin">Admin</option>
       </select>
       <div id="rollField">
         <label>Roll Number</label>
@@ -393,6 +397,7 @@ async function doLogin() {
     saveSession();
     if (session.role === 'student') showStudentPortal();
     else if (session.role === 'guard') showGuardPortal();
+    else if (session.role === 'admin') showAdminPortal();
     else showBusSchedulerPortal();
   } catch (e) {
     showAlert('alert', e.message, 'error');
@@ -515,6 +520,7 @@ function showStudentPortal() {
       <div class="menu-grid">
         <div class="menu-btn" onclick="showCreateRequest()"><span class="menu-icon">🚗</span>Create Pickup Request</div>
         <div class="menu-btn" onclick="showStudentStatus()"><span class="menu-icon">📋</span>Check Request Status</div>
+        <div class="menu-btn" onclick="showTimetable('showStudentPortal')"><span class="menu-icon">🕒</span>Bus Timetable</div>
       </div>
       <hr class="divider">
       <button class="btn btn-outline btn-sm" onclick="doLogout()" style="width:100%">🚪 Logout</button>
@@ -605,6 +611,8 @@ async function showGuardPortal() {
         <div class="menu-btn" onclick="showPendingRequests()"><span class="menu-icon">📥</span>Process Requests <br><small class="text-muted">${pendingCount} pending</small></div>
         <div class="menu-btn" onclick="showApprovedList()"><span class="menu-icon">✅</span>Approved</div>
         <div class="menu-btn" onclick="showRejectedList()"><span class="menu-icon">❌</span>Rejected</div>
+        <div class="menu-btn" onclick="showRequestList('COMPLETED','🏁 Completed Rides')"><span class="menu-icon">🏁</span>Completed</div>
+        <div class="menu-btn" onclick="showTimetable('showGuardPortal')"><span class="menu-icon">🕒</span>Timetable</div>
       </div>
       <hr class="divider">
       <button class="btn btn-outline btn-sm" onclick="doLogout()" style="width:100%">🚪 Logout</button>
@@ -661,16 +669,16 @@ async function decideRequest(id, action) {
 function showApprovedList() { showRequestList('APPROVED', '✅ Approved Requests'); }
 function showRejectedList() { showRequestList('REJECTED', '❌ Rejected Requests'); }
 
-async function showRequestList(status, title) {
-  render(`<a class="back-link" onclick="showGuardPortal()">← Back</a><div class="card"><h2>${title}</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+async function showRequestList(status, title, back = 'showGuardPortal') {
+  render(backLink(back) + `<div class="card"><h2>${title}</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
   let rows;
   try {
     rows = (await apiCall('GET', '/api/requests?status=' + status, undefined, true)).requests;
   } catch (e) {
-    return render(`<a class="back-link" onclick="showGuardPortal()">← Back</a><div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+    return render(backLink(back) + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
   }
   let html = `
-    <a class="back-link" onclick="showGuardPortal()">← Back</a>
+    ${backLink(back)}
     <div class="card">
       <h2>${title} (${rows.length})</h2>
   `;
@@ -682,11 +690,12 @@ async function showRequestList(status, title) {
       <div class="list-item">
         <div class="row">
           <span class="label">Request #${r.request_number}</span>
-          <span class="badge badge-${status === 'APPROVED' ? 'approved' : 'rejected'}">${status}</span>
+          ${badge(r.status)}
         </div>
         <div class="value">${r.student_name} (Roll: ${r.roll_number})</div>
         <div>${r.pickup} → ${r.dropoff}</div>
         ${r.bus ? `<div class="text-muted">🚌 Bus #${r.bus}</div>` : ''}
+        ${status === 'APPROVED' ? `<button class="btn btn-success btn-sm" onclick="completeRide(${r.request_number})">🏁 Complete Ride</button>` : ''}
       </div>`;
   });
   html += '</div>';
@@ -706,6 +715,7 @@ function showBusSchedulerPortal() {
         <div class="menu-btn" onclick="doAutoAssign()"><span class="menu-icon">🔄</span>Auto-Assign</div>
         <div class="menu-btn" onclick="showBusSchedule()"><span class="menu-icon">📊</span>Bus Schedule</div>
         <div class="menu-btn" onclick="showRouteCapacity()"><span class="menu-icon">🗺️</span>Route Capacity</div>
+        <div class="menu-btn" onclick="showTimetableEditor()"><span class="menu-icon">🕒</span>Edit Timetable</div>
       </div>
       <hr class="divider">
       <button class="btn btn-outline btn-sm" onclick="doLogout()" style="width:100%">🚪 Logout</button>
@@ -751,29 +761,29 @@ async function registerBus() {
   }
 }
 
-async function doAutoAssign() {
+async function doAutoAssign(back = 'showBusSchedulerPortal') {
   try {
     const r = await apiCall('POST', '/api/buses/assign', {}, true);
-    let msg = `${r.assigned} request(s) assigned.`;
+    let msg = `${r.assigned_count} request(s) assigned.`;
     if (r.no_bus_available) msg += ` ${r.no_bus_available} could not be placed (no matching bus or all full).`;
-    if (r.warned_buses && r.warned_buses.length) msg += ` ⚠️ Buses at 80%+ capacity: ${r.warned_buses.map(b => '#' + b).join(', ')}`;
+    if (r.warned_bus_numbers && r.warned_bus_numbers.length) msg += ` ⚠️ Buses at 80%+ capacity: ${r.warned_bus_numbers.map(b => '#' + b).join(', ')}`;
     alert(msg);
-    showBusSchedulerPortal();
+    window[back]();
   } catch (e) {
     alert(e.message);
   }
 }
 
-async function showBusSchedule() {
-  render(`<a class="back-link" onclick="showBusSchedulerPortal()">← Back</a><div class="card"><h2><span class="icon">📊</span> Bus Schedule</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+async function showBusSchedule(back = 'showBusSchedulerPortal') {
+  render(backLink(back) + `<div class="card"><h2><span class="icon">📊</span> Bus Schedule</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
   let buses;
   try {
     buses = (await apiCall('GET', '/api/buses', undefined, true)).buses;
   } catch (e) {
-    return render(`<a class="back-link" onclick="showBusSchedulerPortal()">← Back</a><div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+    return render(backLink(back) + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
   }
   let html = `
-    <a class="back-link" onclick="showBusSchedulerPortal()">← Back</a>
+    ${backLink(back)}
     <div class="card">
       <h2><span class="icon">📊</span> Bus Schedule</h2>
   `;
@@ -799,16 +809,16 @@ async function showBusSchedule() {
   render(html);
 }
 
-async function showRouteCapacity() {
-  render(`<a class="back-link" onclick="showBusSchedulerPortal()">← Back</a><div class="card"><h2><span class="icon">🗺️</span> Route Capacity</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+async function showRouteCapacity(back = 'showBusSchedulerPortal') {
+  render(backLink(back) + `<div class="card"><h2><span class="icon">🗺️</span> Route Capacity</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
   let routes;
   try {
     routes = (await apiCall('GET', '/api/reports/capacity', undefined, true)).routes;
   } catch (e) {
-    return render(`<a class="back-link" onclick="showBusSchedulerPortal()">← Back</a><div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+    return render(backLink(back) + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
   }
   let html = `
-    <a class="back-link" onclick="showBusSchedulerPortal()">← Back</a>
+    ${backLink(back)}
     <div class="card">
       <h2><span class="icon">🗺️</span> Route Capacity</h2>
   `;
@@ -831,6 +841,200 @@ async function showRouteCapacity() {
   render(html);
 }
 
+// ---------- TIMETABLE (all roles) ----------
+function backLink(fn) { return `<a class="back-link" onclick="${fn}()">← Back</a>`; }
+
+async function showTimetable(back) {
+  back = back || 'showLogin';
+  render(backLink(back) + `<div class="card"><h2><span class="icon">🕒</span> Bus Timetable</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let rows;
+  try {
+    rows = (await apiCall('GET', '/api/timetable', undefined, true)).schedule;
+  } catch (e) {
+    return render(backLink(back) + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
+  let html = `
+    ${backLink(back)}
+    <div class="card">
+      <h2><span class="icon">🕒</span> Bus Timetable</h2>
+  `;
+  if (!rows.length) {
+    html += `<div class="empty-state"><div class="icon">🕒</div><p>No departures scheduled yet.</p></div>`;
+  }
+  rows.forEach(s => {
+    const seatBadge = s.seats_available > 0
+      ? `<span class="badge badge-approved">${s.seats_available} seats left</span>`
+      : `<span class="badge badge-full">FULL</span>`;
+    html += `
+      <div class="list-item">
+        <div class="row">
+          <span style="font-weight:700;font-size:1.05rem">🕒 ${s.departure_time}</span>
+          ${seatBadge}
+        </div>
+        <div class="value">🚌 Bus #${s.bus_number} · ${s.route}</div>
+        ${s.label ? `<div class="text-muted">${s.label}</div>` : ''}
+      </div>`;
+  });
+  html += '</div>';
+  render(html);
+}
+
+async function showTimetableEditor(back) {
+  back = back || 'showBusSchedulerPortal';
+  render(backLink(back) + `<div class="card"><h2><span class="icon">🕒</span> Timetable Editor</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let buses, schedule;
+  try {
+    const results = await Promise.all([
+      apiCall('GET', '/api/buses', undefined, true),
+      apiCall('GET', '/api/timetable', undefined, true)
+    ]);
+    buses = results[0].buses;
+    schedule = results[1].schedule;
+  } catch (e) {
+    return render(backLink(back) + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
+  let html = backLink(back) + `
+    <div class="card">
+      <h2><span class="icon">➕</span> Add Departure</h2>
+      <div id="alert"></div>`;
+  if (!buses.length) {
+    html += `<div class="alert alert-warn">Register a bus first — timetable entries attach to buses.</div>`;
+  } else {
+    html += `
+      <label>Bus</label>
+      <select id="tt_bus">
+        ${buses.map(b => `<option value="${b.bus_number}">Bus #${b.bus_number} — ${b.route}</option>`).join('')}
+      </select>
+      <label>Departure Time</label>
+      <input type="time" id="tt_time">
+      <label>Label (optional)</label>
+      <input type="text" id="tt_label" placeholder="e.g. Morning shuttle">
+      <button class="btn btn-primary" onclick="addScheduleEntry()">Add Departure</button>`;
+  }
+  html += `</div>
+    <div class="card">
+      <h2><span class="icon">🕒</span> Scheduled Departures (${schedule.length})</h2>`;
+  if (!schedule.length) {
+    html += `<div class="empty-state"><div class="icon">🕒</div><p>Nothing scheduled yet.</p></div>`;
+  }
+  schedule.forEach(s => {
+    html += `
+      <div class="list-item">
+        <div class="row">
+          <span style="font-weight:700">🕒 ${s.departure_time}</span>
+          <button class="btn btn-danger btn-sm" onclick="deleteScheduleEntry(${s.schedule_id})">🗑 Remove</button>
+        </div>
+        <div class="value">🚌 Bus #${s.bus_number} · ${s.route}</div>
+        ${s.label ? `<div class="text-muted">${s.label}</div>` : ''}
+      </div>`;
+  });
+  html += '</div>';
+  render(html);
+}
+
+async function addScheduleEntry() {
+  const bus_number = parseInt(document.getElementById('tt_bus').value);
+  const departure_time = document.getElementById('tt_time').value;
+  const label = document.getElementById('tt_label').value.trim();
+  if (!departure_time) return showAlert('alert', 'Please pick a departure time.', 'error');
+  try {
+    await apiCall('POST', '/api/timetable', { bus_number, departure_time, label: label || undefined }, true);
+    showTimetableEditor();
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
+  }
+}
+
+async function deleteScheduleEntry(id) {
+  try {
+    await apiCall('DELETE', '/api/timetable/' + id, undefined, true);
+    showTimetableEditor();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function completeRide(id) {
+  try {
+    await apiCall('POST', `/api/requests/${id}/complete`, {}, true);
+    showRequestList('APPROVED', '✅ Approved Requests');
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+// ---------- ADMIN PORTAL ----------
+function showAdminPortal() {
+  render(`
+    <div class="welcome-bar">
+      <span>🛠️ <strong>Admin Portal</strong></span>
+    </div>
+    <div class="card">
+      <h2><span class="icon">⚙️</span> Admin Dashboard</h2>
+      <div class="menu-grid">
+        <div class="menu-btn" onclick="showStaffManagement()"><span class="menu-icon">🔑</span>Staff Accounts</div>
+        <div class="menu-btn" onclick="showTimetableEditor('showAdminPortal')"><span class="menu-icon">🕒</span>Edit Timetable</div>
+        <div class="menu-btn" onclick="showBusSchedule('showAdminPortal')"><span class="menu-icon">📊</span>Bus Schedule</div>
+        <div class="menu-btn" onclick="doAutoAssign('showAdminPortal')"><span class="menu-icon">🔄</span>Auto-Assign</div>
+        <div class="menu-btn" onclick="showRouteCapacity('showAdminPortal')"><span class="menu-icon">🗺️</span>Route Capacity</div>
+        <div class="menu-btn" onclick="showRequestList('APPROVED','✅ Approved Requests','showAdminPortal')"><span class="menu-icon">✅</span>Approved Requests</div>
+      </div>
+      <hr class="divider">
+      <button class="btn btn-outline btn-sm" onclick="doLogout()" style="width:100%">🚪 Logout</button>
+    </div>
+  `);
+}
+
+async function showStaffManagement() {
+  render(backLink('showAdminPortal') + `<div class="card"><h2><span class="icon">🔑</span> Staff Accounts</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let staff;
+  try {
+    staff = (await apiCall('GET', '/api/admin/staff', undefined, true)).staff;
+  } catch (e) {
+    return render(backLink('showAdminPortal') + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
+  let html = backLink('showAdminPortal') + `
+    <div class="card">
+      <h2><span class="icon">🔑</span> Staff Accounts</h2>`;
+  staff.forEach(s => {
+    html += `
+      <div class="list-item">
+        <div class="row">
+          <span class="value" style="text-transform:capitalize">${s.role}</span>
+          <span class="badge ${s.password_state === 'hashed' ? 'badge-approved' : 'badge-rejected'}">${s.password_state}</span>
+        </div>
+      </div>`;
+  });
+  html += `
+      <hr class="divider">
+      <h2><span class="icon">🔒</span> Change Staff Password</h2>
+      <div id="alert"></div>
+      <label>Staff Role</label>
+      <select id="staff_role">
+        ${staff.map(s => `<option value="${s.role}">${s.role}</option>`).join('')}
+      </select>
+      <div class="password-wrap">
+        <label>New Password</label>
+        <input type="password" id="staff_pass" placeholder="Min 8 characters">
+      </div>
+      <button class="btn btn-primary" onclick="changeStaffPassword()">Update Password</button>
+    </div>`;
+  render(html);
+}
+
+async function changeStaffPassword() {
+  const role = document.getElementById('staff_role').value;
+  const pass = document.getElementById('staff_pass').value;
+  if (pass.length < 8) return showAlert('alert', 'Password must be at least 8 characters.', 'error');
+  try {
+    await apiCall('POST', '/api/admin/staff-password', { role, new_password: pass }, true);
+    showAlert('alert', `Password for ${role} updated successfully.`, 'success');
+    document.getElementById('staff_pass').value = '';
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
+  }
+}
+
 // ---------- LOGOUT ----------
 function doLogout() {
   clearSession();
@@ -845,7 +1049,7 @@ if (session) {
     .catch(() => {
       // Token may still be valid for non-student roles (mine is student-only).
       apiCall('GET', '/api/requests', undefined, true)
-        .then(() => { if (session.role === 'guard') showGuardPortal(); else showBusSchedulerPortal(); })
+        .then(() => { if (session.role === 'guard') showGuardPortal(); else if (session.role === 'admin') showAdminPortal(); else showBusSchedulerPortal(); })
         .catch(() => { clearSession(); showLogin(); });
     });
 } else {

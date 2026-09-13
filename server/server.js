@@ -8,7 +8,7 @@ const db = require('./lib/db');
 const { pwHash, pwVerify, randomBytes } = require('./lib/crypto');
 const {
   coreLocationFromName, coreRouteIsValid,
-  coreApproveRequest, coreRejectRequest,
+  coreApproveRequest, coreRejectRequest, coreCompleteRequest,
   coreAssignApprovedRequests,
 } = require('./lib/service');
 const { LOCATIONS, MAX_BUS_CAPACITY } = require('./lib/models');
@@ -92,7 +92,7 @@ app.post('/api/login', ah(async (req, res) => {
     return res.json({ token, role: 'student', roll_number, name: rows[0].name });
   }
 
-  if (role === 'guard' || role === 'scheduler') {
+  if (role === 'guard' || role === 'scheduler' || role === 'admin') {
     const [rows] = await db.query(
       'SELECT password FROM credentials WHERE role = $1', [role]);
     if (!rows.length || !pwVerify(password, rows[0].password)) {
@@ -268,7 +268,18 @@ app.post('/api/requests/:id/reject', authenticate, requireRole('guard'), ah(asyn
   res.json({ request_number: id, status: 'REJECTED' });
 }));
 
-app.get('/api/buses', authenticate, requireRole('scheduler'), ah(async (req, res) => {
+app.post('/api/requests/:id/complete', authenticate, requireRole('guard', 'admin'), ah(async (req, res) => {
+  const id = parseInt(req.params.id);
+  const ok = await coreCompleteRequest(id);
+  if (!ok) {
+    const [rows] = await db.query('SELECT status FROM pickup_requests WHERE request_number = $1', [id]);
+    if (!rows.length) return res.status(404).json({ error: 'request not found' });
+    return res.status(409).json({ error: 'request is not approved (only approved rides can be completed)' });
+  }
+  res.json({ request_number: id, status: 'COMPLETED' });
+}));
+
+app.get('/api/buses', authenticate, requireRole('scheduler', 'admin'), ah(async (req, res) => {
   const [rows] = await db.query('SELECT * FROM buses ORDER BY bus_number');
   const result = rows.map(b => ({
     bus_number: b.bus_number,
@@ -281,7 +292,7 @@ app.get('/api/buses', authenticate, requireRole('scheduler'), ah(async (req, res
   res.json({ count: result.length, buses: result });
 }));
 
-app.post('/api/buses', authenticate, requireRole('scheduler'), ah(async (req, res) => {
+app.post('/api/buses', authenticate, requireRole('scheduler', 'admin'), ah(async (req, res) => {
   const { route_pickup, route_dropoff, max_capacity } = req.body;
   if (route_pickup == null || route_dropoff == null || max_capacity == null) {
     return res.status(400).json({ error: 'route_pickup, route_dropoff and max_capacity are required' });
@@ -302,7 +313,7 @@ app.post('/api/buses', authenticate, requireRole('scheduler'), ah(async (req, re
   });
 }));
 
-app.post('/api/buses/assign', authenticate, requireRole('scheduler'), ah(async (req, res) => {
+app.post('/api/buses/assign', authenticate, requireRole('scheduler', 'admin'), ah(async (req, res) => {
   try {
     const result = await coreAssignApprovedRequests();
     res.json(result);
@@ -311,7 +322,7 @@ app.post('/api/buses/assign', authenticate, requireRole('scheduler'), ah(async (
   }
 }));
 
-app.post('/api/assignments/unassign', authenticate, requireRole('scheduler'), ah(async (req, res) => {
+app.post('/api/assignments/unassign', authenticate, requireRole('scheduler', 'admin'), ah(async (req, res) => {
   const { request_number } = req.body;
   if (!request_number) {
     return res.status(400).json({ error: 'request_number is required' });
@@ -341,7 +352,7 @@ app.post('/api/assignments/unassign', authenticate, requireRole('scheduler'), ah
   }
 }));
 
-app.get('/api/reports/capacity', authenticate, requireRole('guard', 'scheduler'), ah(async (req, res) => {
+app.get('/api/reports/capacity', authenticate, requireRole('guard', 'scheduler', 'admin'), ah(async (req, res) => {
   const [rows] = await db.query(
     'SELECT route_pickup, route_dropoff, SUM(max_capacity)::int AS capacity, '
     + 'SUM(current_count)::int AS assigned, COUNT(*)::int AS buses '
@@ -356,6 +367,88 @@ app.get('/api/reports/capacity', authenticate, requireRole('guard', 'scheduler')
   }));
 
   res.json({ count: result.length, routes: result });
+}));
+
+// ============================================================
+// Timetable endpoints
+// ============================================================
+
+// Public to any authenticated user — students need it to plan ahead.
+app.get('/api/timetable', authenticate, ah(async (req, res) => {
+  const [rows] = await db.query(
+    'SELECT s.schedule_id, s.bus_number, s.departure_time, s.label, '
+    + 'b.route_pickup, b.route_dropoff, b.current_count, b.max_capacity '
+    + 'FROM bus_schedules s JOIN buses b ON s.bus_number = b.bus_number '
+    + 'ORDER BY s.departure_time, s.bus_number');
+  const result = rows.map(r => ({
+    schedule_id: r.schedule_id,
+    bus_number: r.bus_number,
+    departure_time: String(r.departure_time).slice(0, 5),
+    label: r.label,
+    route: `${LOCATIONS[r.route_pickup]} → ${LOCATIONS[r.route_dropoff]}`,
+    seats_available: r.max_capacity - r.current_count,
+    max_capacity: r.max_capacity,
+  }));
+  res.json({ count: result.length, schedule: result });
+}));
+
+app.post('/api/timetable', authenticate, requireRole('scheduler', 'admin'), ah(async (req, res) => {
+  const { bus_number, departure_time, label } = req.body;
+  const t = typeof departure_time === 'string' ? departure_time.trim() : '';
+  if (!bus_number || !/^\d{1,2}:\d{2}$/.test(t)) {
+    return res.status(400).json({ error: 'bus_number and departure_time (HH:MM) are required' });
+  }
+  const [h, m] = t.split(':').map(Number);
+  if (h > 23 || m > 59) {
+    return res.status(400).json({ error: 'departure_time must be a valid HH:MM time' });
+  }
+  const [exists] = await db.query('SELECT COUNT(*)::int AS cnt FROM buses WHERE bus_number = $1', [bus_number]);
+  if (!exists[0].cnt) {
+    return res.status(404).json({ error: 'bus not found' });
+  }
+  const [dupe] = await db.query(
+    'SELECT COUNT(*)::int AS cnt FROM bus_schedules WHERE bus_number = $1 AND departure_time = $2',
+    [bus_number, t]);
+  if (dupe[0].cnt) {
+    return res.status(409).json({ error: 'this bus already has a departure at that time' });
+  }
+  const [ins] = await db.query(
+    'INSERT INTO bus_schedules (bus_number, departure_time, label) VALUES ($1, $2, $3) RETURNING schedule_id',
+    [bus_number, t, label || null]);
+  res.status(201).json({ schedule_id: ins[0].schedule_id, bus_number, departure_time: t, label: label || null });
+}));
+
+app.delete('/api/timetable/:id', authenticate, requireRole('scheduler', 'admin'), ah(async (req, res) => {
+  const [, rowCount] = await db.query('DELETE FROM bus_schedules WHERE schedule_id = $1', [parseInt(req.params.id)]);
+  if (!rowCount) return res.status(404).json({ error: 'schedule entry not found' });
+  res.json({ deleted: true });
+}));
+
+// ============================================================
+// Admin: staff credential management
+// ============================================================
+
+app.get('/api/admin/staff', authenticate, requireRole('admin'), ah(async (req, res) => {
+  const [rows] = await db.query(
+    "SELECT role, CASE WHEN password LIKE 'pbkdf2-sha256$%' THEN 'hashed' ELSE 'plaintext' END AS password_state FROM credentials ORDER BY role");
+  res.json({ count: rows.length, staff: rows });
+}));
+
+app.post('/api/admin/staff-password', authenticate, requireRole('admin'), ah(async (req, res) => {
+  const { role, new_password } = req.body;
+  if (!role || !new_password) {
+    return res.status(400).json({ error: 'role and new_password are required' });
+  }
+  if (!['guard', 'scheduler', 'admin'].includes(role)) {
+    return res.status(400).json({ error: 'role must be guard, scheduler or admin' });
+  }
+  if (String(new_password).length < 8) {
+    return res.status(400).json({ error: 'password must be at least 8 characters' });
+  }
+  const [, rowCount] = await db.query(
+    'UPDATE credentials SET password = $1 WHERE role = $2', [pwHash(new_password), role]);
+  if (!rowCount) return res.status(404).json({ error: 'role not found' });
+  res.json({ role, updated: true });
 }));
 
 // Central error handler — target of the ah() wrapper above.

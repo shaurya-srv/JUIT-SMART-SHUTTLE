@@ -32,6 +32,27 @@ async function coreRejectRequest(requestNumber) {
   return rowCount > 0;
 }
 
+// Ride completion: APPROVED -> COMPLETED. Frees the bus seat (if any) but
+// keeps the assignment row so the student's history still shows the bus.
+async function coreCompleteRequest(requestNumber) {
+  const [rows] = await db.query(
+    'SELECT status FROM pickup_requests WHERE request_number = $1', [requestNumber]);
+  if (!rows.length || rows[0].status !== 'APPROVED') return false;
+  const [, rowCount] = await db.query(
+    "UPDATE pickup_requests SET status = 'COMPLETED', completed_at = now() " +
+    'WHERE request_number = $1', [requestNumber]);
+  if (!(rowCount > 0)) return false;
+
+  const [asg] = await db.query(
+    'SELECT bus_number FROM bus_assignments WHERE request_number = $1', [requestNumber]);
+  if (asg.length) {
+    await db.query(
+      'UPDATE buses SET current_count = GREATEST(current_count - 1, 0) WHERE bus_number = $1',
+      [asg[0].bus_number]);
+  }
+  return true;
+}
+
 // Bus assignment algorithm
 async function coreAssignApprovedRequests() {
   const result = {
@@ -111,6 +132,6 @@ async function coreAssignApprovedRequests() {
 
 module.exports = {
   coreLocationFromName, coreRouteIsValid,
-  coreApproveRequest, coreRejectRequest,
+  coreApproveRequest, coreRejectRequest, coreCompleteRequest,
   coreAssignApprovedRequests,
 };
