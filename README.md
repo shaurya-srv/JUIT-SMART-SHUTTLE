@@ -12,6 +12,7 @@ assigns them to buses with live capacity tracking and a departure timetable.
 | Role | Capabilities |
 |---|---|
 | Student | Register, login, create pickup requests, track status, view timetable with seats left |
+| Anyone | Check the **public timetable** from the login screen — today's departures, next ride, live seat counts (no login) |
 | Guard | Approve/reject pending requests, complete rides (frees the seat), view all lists |
 | Scheduler | Register buses, auto-assign approved requests, route capacity report, edit departure timetable |
 | Admin | Everything the scheduler can do + staff password management |
@@ -84,3 +85,6 @@ legacy/                    archived C/MySQL implementation (reference only)
 
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full feature list,
 architecture diagrams, data model, and operational gotchas.
+See **[ROADMAP.md](ROADMAP.md)** for PRD implementation status, acceptance
+criteria, and the phased build order for the dispatch optimizer and
+conductor/live-tracking features.

@@ -10,6 +10,7 @@ const {
   coreLocationFromName, coreRouteIsValid,
   coreApproveRequest, coreRejectRequest, coreCompleteRequest,
   coreAssignApprovedRequests,
+  parseRequiredTime, BOOKING_CUTOFF_MINUTES,
 } = require('./lib/service');
 const { LOCATIONS, MAX_BUS_CAPACITY } = require('./lib/models');
 
@@ -150,7 +151,7 @@ app.post('/api/reset-password', ah(async (req, res) => {
 // ============================================================
 
 app.post('/api/requests', authenticate, requireRole('student'), ah(async (req, res) => {
-  const { pickup_place, dropoff_place } = req.body;
+  const { pickup_place, dropoff_place, required_time } = req.body;
   if (!pickup_place || !dropoff_place) {
     return res.status(400).json({ error: 'pickup_place and dropoff_place are required' });
   }
@@ -158,6 +159,20 @@ app.post('/api/requests', authenticate, requireRole('student'), ah(async (req, r
   const d = coreLocationFromName(dropoff_place);
   if (!coreRouteIsValid(p, d)) {
     return res.status(400).json({ error: 'unknown pickup/dropoff or same-location route' });
+  }
+
+  // PRD 6.1 / FR-03: when a required transport time is given, it must be at
+  // least 30 minutes ahead (the planning window). Optional for now — legacy
+  // flows without a time keep working until the booking-slot rollout.
+  let neededAt = null;
+  if (required_time !== undefined && required_time !== null && required_time !== '') {
+    const check = parseRequiredTime(required_time);
+    if (!check.ok) {
+      if (check.error === 'invalid') return res.status(400).json({ error: 'required_time is not a valid date/time' });
+      if (check.error === 'past') return res.status(400).json({ error: 'required_time is already in the past' });
+      return res.status(400).json({ error: `book at least ${BOOKING_CUTOFF_MINUTES} minutes ahead of the required time` });
+    }
+    neededAt = check.date.toISOString();
   }
 
   const conn = await db.getConnection();
@@ -168,10 +183,10 @@ app.post('/api/requests', authenticate, requireRole('student'), ah(async (req, r
     const dir = p < d ? 1 : -1;
     await conn.query(
       'INSERT INTO pickup_requests (request_number, student_roll_number, pickup_place, dropoff_place, '
-      + 'pickup_location, dropoff_location, direction, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-      [rn, req.session.roll_number, pickup_place, dropoff_place, p, d, dir, 'PENDING_APPROVAL']);
+      + 'pickup_location, dropoff_location, direction, required_time, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+      [rn, req.session.roll_number, pickup_place, dropoff_place, p, d, dir, neededAt, 'PENDING_APPROVAL']);
     await conn.commit();
-    res.status(201).json({ request_number: rn, status: 'PENDING_APPROVAL' });
+    res.status(201).json({ request_number: rn, status: 'PENDING_APPROVAL', required_time: neededAt });
   } catch (err) {
     await conn.rollback();
     res.status(500).json({ error: 'could not create request' });
@@ -183,7 +198,7 @@ app.post('/api/requests', authenticate, requireRole('student'), ah(async (req, r
 app.get('/api/requests/mine', authenticate, requireRole('student'), ah(async (req, res) => {
   const [rows] = await db.query(
     'SELECT r.request_number, s.name AS student_name, s.roll_number AS student_roll_number, '
-    + 's.hostel_name, s.room_number, s.phone_number, r.pickup_place, r.dropoff_place, r.status '
+    + 's.hostel_name, s.room_number, s.phone_number, r.pickup_place, r.dropoff_place, r.status, r.required_time '
     + 'FROM pickup_requests r JOIN students s ON r.student_roll_number = s.roll_number '
     + 'WHERE r.student_roll_number = $1 ORDER BY r.request_number DESC', [req.session.roll_number]);
 
@@ -202,6 +217,7 @@ app.get('/api/requests/mine', authenticate, requireRole('student'), ah(async (re
     pickup: r.pickup_place,
     dropoff: r.dropoff_place,
     status: r.status,
+    required_time: r.required_time,
     bus: assignMap[r.request_number] || 0,
   }));
 
@@ -210,7 +226,7 @@ app.get('/api/requests/mine', authenticate, requireRole('student'), ah(async (re
 
 app.get('/api/requests', authenticate, requireRole('guard', 'scheduler'), ah(async (req, res) => {
   let query = 'SELECT r.request_number, s.name AS student_name, s.roll_number AS student_roll_number, '
-    + 's.hostel_name, s.room_number, s.phone_number, r.pickup_place, r.dropoff_place, r.status '
+    + 's.hostel_name, s.room_number, s.phone_number, r.pickup_place, r.dropoff_place, r.status, r.required_time '
     + 'FROM pickup_requests r JOIN students s ON r.student_roll_number = s.roll_number';
   const params = [];
   let paramIdx = 1;
@@ -240,6 +256,7 @@ app.get('/api/requests', authenticate, requireRole('guard', 'scheduler'), ah(asy
     pickup: r.pickup_place,
     dropoff: r.dropoff_place,
     status: r.status,
+    required_time: r.required_time,
     bus: assignMap[r.request_number] || 0,
   }));
 
@@ -288,12 +305,14 @@ app.get('/api/buses', authenticate, requireRole('scheduler', 'admin'), ah(async 
     route_dropoff: b.route_dropoff,
     assigned: b.current_count,
     capacity: b.max_capacity,
+    vehicle_type: b.vehicle_type || 'bus',
+    state: b.state || 'AVAILABLE',
   }));
   res.json({ count: result.length, buses: result });
 }));
 
 app.post('/api/buses', authenticate, requireRole('scheduler', 'admin'), ah(async (req, res) => {
-  const { route_pickup, route_dropoff, max_capacity } = req.body;
+  const { route_pickup, route_dropoff, max_capacity, vehicle_type } = req.body;
   if (route_pickup == null || route_dropoff == null || max_capacity == null) {
     return res.status(400).json({ error: 'route_pickup, route_dropoff and max_capacity are required' });
   }
@@ -303,14 +322,37 @@ app.post('/api/buses', authenticate, requireRole('scheduler', 'admin'), ah(async
   if (max_capacity < 1 || max_capacity > MAX_BUS_CAPACITY) {
     return res.status(400).json({ error: 'max_capacity must be 1-30' });
   }
+  // PRD 6.8: vehicle sizing — van (small groups) vs bus. Defaults to bus.
+  const vType = vehicle_type === undefined || vehicle_type === null ? 'bus' : vehicle_type;
+  if (!['bus', 'van'].includes(vType)) {
+    return res.status(400).json({ error: 'vehicle_type must be bus or van' });
+  }
   const [maxRow] = await db.query('SELECT COALESCE(MAX(bus_number),0)+1 AS bn FROM buses');
   const bn = maxRow[0].bn;
   await db.query(
-    'INSERT INTO buses (bus_number, route_pickup, route_dropoff, current_count, max_capacity) VALUES ($1,$2,$3,$4,$5)',
-    [bn, route_pickup, route_dropoff, 0, max_capacity]);
+    'INSERT INTO buses (bus_number, route_pickup, route_dropoff, current_count, max_capacity, vehicle_type) VALUES ($1,$2,$3,$4,$5,$6)',
+    [bn, route_pickup, route_dropoff, 0, max_capacity, vType]);
   res.status(201).json({
-    bus_number: bn, route_pickup, route_dropoff, max_capacity,
+    bus_number: bn, route_pickup, route_dropoff, max_capacity, vehicle_type: vType,
   });
+}));
+
+// PRD 7.13: operational state transitions. Only AVAILABLE vehicles are
+// picked by auto-assign; MAINTENANCE / OFFLINE / DISPATCHED / ON_TRIP are
+// skipped by the assignment algorithm.
+app.patch('/api/buses/:bus_number/state', authenticate, requireRole('scheduler', 'admin'), ah(async (req, res) => {
+  const bn = parseInt(req.params.bus_number);
+  const { state } = req.body;
+  if (!bn || !state) {
+    return res.status(400).json({ error: 'bus_number and state are required' });
+  }
+  const STATES = ['AVAILABLE', 'DISPATCHED', 'ON_TRIP', 'MAINTENANCE', 'OFFLINE'];
+  if (!STATES.includes(state)) {
+    return res.status(400).json({ error: `state must be one of: ${STATES.join(', ')}` });
+  }
+  const [, rowCount] = await db.query('UPDATE buses SET state = $1 WHERE bus_number = $2', [state, bn]);
+  if (!rowCount) return res.status(404).json({ error: 'bus not found' });
+  res.json({ bus_number: bn, state });
 }));
 
 app.post('/api/buses/assign', authenticate, requireRole('scheduler', 'admin'), ah(async (req, res) => {
@@ -373,14 +415,14 @@ app.get('/api/reports/capacity', authenticate, requireRole('guard', 'scheduler',
 // Timetable endpoints
 // ============================================================
 
-// Public to any authenticated user — students need it to plan ahead.
-app.get('/api/timetable', authenticate, ah(async (req, res) => {
+// Timetable payload shared by the authenticated and public endpoints.
+async function timetablePayload() {
   const [rows] = await db.query(
     'SELECT s.schedule_id, s.bus_number, s.departure_time, s.label, '
-    + 'b.route_pickup, b.route_dropoff, b.current_count, b.max_capacity '
+    + 'b.route_pickup, b.route_dropoff, b.current_count, b.max_capacity, b.vehicle_type '
     + 'FROM bus_schedules s JOIN buses b ON s.bus_number = b.bus_number '
     + 'ORDER BY s.departure_time, s.bus_number');
-  const result = rows.map(r => ({
+  const schedule = rows.map(r => ({
     schedule_id: r.schedule_id,
     bus_number: r.bus_number,
     departure_time: String(r.departure_time).slice(0, 5),
@@ -388,8 +430,22 @@ app.get('/api/timetable', authenticate, ah(async (req, res) => {
     route: `${LOCATIONS[r.route_pickup]} → ${LOCATIONS[r.route_dropoff]}`,
     seats_available: r.max_capacity - r.current_count,
     max_capacity: r.max_capacity,
+    vehicle_type: r.vehicle_type || (/van/i.test(r.label || '') ? 'van' : 'bus'),
   }));
-  res.json({ count: result.length, schedule: result });
+  return { count: schedule.length, schedule };
+}
+
+// Public to any authenticated user — students need it to plan ahead.
+app.get('/api/timetable', authenticate, ah(async (req, res) => {
+  res.json(await timetablePayload());
+}));
+
+// Public snapshot — no auth, so students can check today's departures and
+// live seat counts from the login screen (e.g. at the hostel gate).
+// Read-only; exposes only times, routes, labels and seat counts — never
+// student or request data.
+app.get('/api/timetable/public', ah(async (req, res) => {
+  res.json(await timetablePayload());
 }));
 
 app.post('/api/timetable', authenticate, requireRole('scheduler', 'admin'), ah(async (req, res) => {

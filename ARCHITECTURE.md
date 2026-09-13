@@ -15,10 +15,15 @@ in production anymore.
 ### Student portal
 - Register (roll number, name, room, hostel, phone, password)
 - Create pickup requests between the four locations
-  (JUIT, Ravli PG, Peach Tree, Waknaghat)
+  (JUIT, Ravli PG, Peach Tree, Waknaghat), optionally with a **required
+  transport time** — must be booked ≥ 30 min ahead (PRD FR-03, planning
+  window for the dispatch optimizer)
 - Track own requests with live status and assigned bus number
 - View the **bus timetable**: departure times, bus numbers, routes,
   and seats remaining per departure
+- No account? The login screen links a **public timetable** (today / full
+  week toggle + next departure) served by the unauthenticated
+  `GET /api/timetable/public` (read-only, exposes no student data)
 
 ### Guard portal
 - Dashboard with live pending-request count
@@ -29,9 +34,13 @@ in production anymore.
 - View the timetable
 
 ### Scheduler portal
-- Register buses with route (pickup → dropoff) and capacity (1–30)
+- Register buses/vans with route (pickup → dropoff), capacity (1–30) and
+  vehicle type (bus/van)
+- **Vehicle state management** (AVAILABLE / DISPATCHED / ON_TRIP /
+  MAINTENANCE / OFFLINE) — set from the Bus Schedule view
 - **Auto-assign**: batch-assign approved requests to the first matching-route
-  bus with free seats (atomic capacity guard; 80%-full warning report)
+  AVAILABLE vehicle with free seats (atomic capacity guard; 80%-full warning
+  report; MAINTENANCE/OFFLINE/DISPATCHED/ON_TRIP vehicles are skipped)
 - Bus schedule view with per-bus live seat bars
 - Route capacity report (seats assigned vs capacity per route)
 - **Timetable editor**: add/remove scheduled departures per bus
@@ -74,7 +83,7 @@ PENDING_APPROVAL ──guard──► APPROVED ──guard──► COMPLETED (s
 └─────────────────────────────────────────────────────────┘
 ```
 
-### Backend (Express, 20 routes)
+### Backend (Express, 21 routes)
 - **Auth**: JWT bearer tokens, 8-hour expiry, signed with `JWT_SECRET`
 - **Passwords**: PBKDF2-HMAC-SHA256, 60,000 iterations, per-row random salt
   (`pbkdf2-sha256$iter$salt$hash`); legacy plaintext rows auto-upgrade on login
@@ -109,6 +118,9 @@ server/
   check-db.js              standalone DB connectivity checker
   supabase-schema.sql      base schema (5 tables + credential seeds)
   migrations/001_...sql    bus_schedules table + completed_at column
+  migrations/002_...sql    fixed Mon-Sat timetable seed (07:45/08:15, 16:55/17:30)
+  migrations/003_...sql    Sunday van seed (09:00/10:30, 16:55/17:30, 12-seat vans)
+  migrations/004_...sql    dispatch foundation: required_time, vehicle_type, state
 vercel.json                rewrites only ("/api/*" → function)
 .vercelignore              keeps legacy/, installers, local junk out of uploads
 legacy/                    archived C CLI + winsock2 HTTP server + MySQL code
@@ -120,8 +132,8 @@ legacy/                    archived C CLI + winsock2 HTTP server + MySQL code
 |---|---|
 | `students` | roll number (PK), name, room, hostel, phone, PBKDF2 password |
 | `credentials` | one row per staff role (`guard`, `scheduler`, `admin`), PBKDF2 password |
-| `pickup_requests` | request number, student FK, named places, location indexes, direction, status, `completed_at` |
-| `buses` | bus number, route pickup/dropoff (location indexes), `current_count`, `max_capacity` |
+| `pickup_requests` | request number, student FK, named places, location indexes, direction, status, `required_time` (PRD 6.1), `completed_at` |
+| `buses` | bus number, route pickup/dropoff (location indexes), `current_count`, `max_capacity`, `vehicle_type` (bus/van), `state` (AVAILABLE/DISPATCHED/ON_TRIP/MAINTENANCE/OFFLINE), `last_service`/`next_service` |
 | `bus_assignments` | request → bus mapping (one per request), keeps history after completion |
 | `bus_schedules` | per-bus departure times (`TIME`), optional label, FK to buses |
 

@@ -6,9 +6,32 @@ const { locationFromName, routeIsValid, LOC_COUNT, MAX_BUSES } = require('./mode
 
 const CORE_MAX_REQUESTS = 512;
 
+// PRD 6.1 / FR-03: a request must be submitted at least this many minutes
+// before the required transport time, creating the planning window (6.2).
+const BOOKING_CUTOFF_MINUTES = 30;
+
+// PRD 7.13: only vehicles in these states may receive auto-assignments.
+const ASSIGNABLE_VEHICLE_STATES = ['AVAILABLE'];
+
 // Location rules
 function coreLocationFromName(name) { return locationFromName(name); }
 function coreRouteIsValid(p, d)     { return routeIsValid(p, d); }
+
+// PRD 6.1 / FR-03 — validate a student-supplied required transport time.
+// Pure function: returns { ok: true, date } or { ok: false, error } where
+// error is one of 'invalid', 'past', 'cutoff'. Accepts Date or any value
+// Date can parse; `now` is injectable for tests.
+function parseRequiredTime(input, now = new Date()) {
+  const d = input instanceof Date ? input : new Date(input);
+  if (!input || isNaN(d.getTime())) return { ok: false, error: 'invalid' };
+  // Allow a small clock-skew margin so a just-past "now" is not rejected
+  // (it then reports 'cutoff', which is the friendlier message).
+  if (d.getTime() < now.getTime() - 120 * 1000) return { ok: false, error: 'past' };
+  if (d.getTime() - now.getTime() < BOOKING_CUTOFF_MINUTES * 60 * 1000) {
+    return { ok: false, error: 'cutoff' };
+  }
+  return { ok: true, date: d };
+}
 
 // Request lifecycle transitions
 async function coreApproveRequest(requestNumber) {
@@ -59,6 +82,7 @@ async function coreAssignApprovedRequests() {
     assigned_count: 0,
     skipped_already_assigned: 0,
     no_bus_available: 0,
+    skipped_unavailable_vehicles: 0,
     warned_bus_numbers: [],
     warned_count: 0,
   };
@@ -68,8 +92,11 @@ async function coreAssignApprovedRequests() {
     await conn.beginTransaction();
 
     const [buses] = await conn.query(
-      'SELECT bus_number, route_pickup, route_dropoff, current_count, max_capacity '
+      'SELECT bus_number, route_pickup, route_dropoff, current_count, max_capacity, state '
       + 'FROM buses ORDER BY bus_number');
+    // PRD 7.13: MAINTENANCE / OFFLINE / actively-dispatched vehicles are
+    // never considered for automated assignment.
+    const assignable = buses.filter(b => ASSIGNABLE_VEHICLE_STATES.includes(b.state));
     const [reqs] = await conn.query(
       'SELECT request_number, pickup_location, dropoff_location '
       + 'FROM pickup_requests WHERE status = $1 ORDER BY request_number', ['APPROVED']);
@@ -85,7 +112,7 @@ async function coreAssignApprovedRequests() {
       }
 
       let placed = false;
-      for (const bus of buses) {
+      for (const bus of assignable) {
         if (bus.route_pickup === req.pickup_location &&
             bus.route_dropoff === req.dropoff_location &&
             bus.current_count < bus.max_capacity) {
@@ -127,6 +154,7 @@ async function coreAssignApprovedRequests() {
     conn.release();
   }
 
+  result.skipped_unavailable_vehicles = buses.length - assignable.length;
   return result;
 }
 
@@ -134,4 +162,5 @@ module.exports = {
   coreLocationFromName, coreRouteIsValid,
   coreApproveRequest, coreRejectRequest, coreCompleteRequest,
   coreAssignApprovedRequests,
+  parseRequiredTime, BOOKING_CUTOFF_MINUTES, ASSIGNABLE_VEHICLE_STATES,
 };

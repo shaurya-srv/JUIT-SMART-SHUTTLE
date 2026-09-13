@@ -186,6 +186,18 @@
   .badge-completed { background: #e0e0e0; color: #3c4043; }
   .badge-full { background: var(--danger); color: #fff; }
   .badge-warn { background: var(--warn); color: #333; }
+  .tt-chip {
+    display: inline-block;
+    padding: 6px 10px;
+    border: 1.5px solid var(--border);
+    border-radius: 8px;
+    font-size: .8rem;
+    font-weight: 600;
+    background: #fafafa;
+    white-space: nowrap;
+  }
+  .tt-chip.full { border-color: var(--danger); color: var(--danger); }
+  .tt-chip.next { border-color: var(--accent); background: #e6f4ea; color: #137333; }
   .capacity-bar {
     height: 8px;
     background: #e0e0e0;
@@ -320,6 +332,50 @@ const LOCATIONS = ['JUIT', 'Ravli PG', 'Peach Tree', 'Waknaghat'];
 const locName = (i) => LOCATIONS[i] || 'Unknown';
 const locIndex = (s) => LOCATIONS.indexOf(s);
 const routeName = (p, d) => `${p} → ${d}`;
+const WEEKDAY_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+
+// 24h "HH:MM" (or a full time string) -> friendly 12h "7:45 AM".
+function to12h(t) {
+  const m = /^(\d{1,2}):(\d{2})/.exec(String(t));
+  if (!m) return String(t);
+  let h = parseInt(m[1], 10);
+  const ap = h >= 12 ? 'PM' : 'AM';
+  h = h % 12; if (h === 0) h = 12;
+  return `${h}:${m[2]} ${ap}`;
+}
+
+// Does a schedule entry run on the given weekday (0=Sunday)? The schema has
+// no day-of-week column, so service days are parsed from the label
+// ('Mon-Sat', 'Sunday van', etc.); unlabeled rows are treated as daily.
+function runsOnDay(label, day) {
+  const l = String(label || '').toLowerCase();
+  if (/\bsun(day)?\b/.test(l)) return day === 0;                    // Sunday-only (vans)
+  if (/\bmon\s*[-–]\s*(sat|saturday)\b/.test(l)) return day >= 1 && day <= 6;
+  if (/\bmon\s*[-–]\s*(fri|friday)\b/.test(l)) return day >= 1 && day <= 5;
+  return true; // daily or unlabeled
+}
+
+// Next upcoming departure across the whole week — Mon-Sat fixed buses plus
+// Sunday vans. Evaluated in the viewer's local time.
+// rows: [{departure_time:'HH:MM', label, ...}]. Returns the row plus daysAhead
+// (0 = today) or null when nothing is scheduled within a week.
+function nextDeparture(rows, from) {
+  for (let daysAhead = 0; daysAhead <= 7; daysAhead++) {
+    const d = new Date(from);
+    d.setDate(d.getDate() + daysAhead);
+    const minsNow = d.getHours() * 60 + d.getMinutes();
+    const candidates = rows
+      .map(s => ({ s, m: /^(\d{1,2}):(\d{2})/.exec(s.departure_time) }))
+      .filter(x => x.m && runsOnDay(x.s.label, d.getDay()))
+      .map(x => ({ s: x.s, hm: parseInt(x.m[1], 10) * 60 + parseInt(x.m[2], 10) }))
+      .filter(x => daysAhead > 0 || x.hm > minsNow)
+      .sort((a, b) => a.hm - b.hm);
+    if (candidates.length) {
+      return { ...candidates[0].s, daysAhead, weekday: WEEKDAY_NAMES[d.getDay()] };
+    }
+  }
+  return null;
+}
 
 // Session survives reload via localStorage (token only — server holds the state).
 let session = JSON.parse(localStorage.getItem('jss_session') || 'null');
@@ -337,7 +393,13 @@ const badge = (status) => {
 // ============================================================
 const $app = document.getElementById('app');
 
-function render(html) { $app.innerHTML = html; }
+function render(html) {
+  // Any screen change tears down the public timetable's live refresh; the
+  // public view re-arms it after its final render. This guarantees no stray
+  // poller can survive a navigation (login, portal switch, etc.).
+  stopPublicTimetableRefresh();
+  $app.innerHTML = html;
+}
 
 // ---------- LOGIN PAGE ----------
 function showLogin() {
@@ -365,6 +427,7 @@ function showLogin() {
       <a class="forgot-link" onclick="showResetPassword()">🔑 Forgot Password?</a>
       <hr class="divider">
       <button class="btn btn-outline" onclick="showRegister()">📝 Register New Student</button>
+      <a class="forgot-link" onclick="showPublicTimetable()">🕒 Bus &amp; Van Timetable — no login needed</a>
     </div>
   `);
   document.getElementById('role').addEventListener('change', e => {
@@ -542,6 +605,8 @@ function showCreateRequest() {
       <select id="req_dropoff">
         ${LOCATIONS.map((l,i) => `<option value="${i}" ${i===1?'selected':''}>${l}</option>`).join('')}
       </select>
+      <label>Required Transport Time <span class="text-muted">(optional · book ≥ 30 min ahead)</span></label>
+      <input type="datetime-local" id="req_time">
       <button class="btn btn-primary" onclick="submitRequest()">Submit Request</button>
     </div>
   `);
@@ -552,8 +617,11 @@ async function submitRequest() {
   const dropoff = locName(parseInt(document.getElementById('req_dropoff').value));
   if (pickup === dropoff) return showAlert('alert', 'Pickup and dropoff must be different.', 'error');
 
+  const timeVal = document.getElementById('req_time').value;
+  const required_time = timeVal ? new Date(timeVal).toISOString() : undefined;
+
   try {
-    const data = await apiCall('POST', '/api/requests', { pickup_place: pickup, dropoff_place: dropoff }, true);
+    const data = await apiCall('POST', '/api/requests', { pickup_place: pickup, dropoff_place: dropoff, required_time }, true);
     showAlert('alert', `Request #${data.request_number} submitted successfully!`, 'success');
     setTimeout(showStudentPortal, 1200);
   } catch (e) {
@@ -579,6 +647,7 @@ async function showStudentStatus() {
   } else {
     rows.forEach(r => {
       const busLabel = r.bus ? `Bus #${r.bus}` : 'Not assigned';
+      const when = r.required_time ? `<div class="text-muted">⏰ Needed by: ${new Date(r.required_time).toLocaleString()}</div>` : '';
       html += `
         <div class="list-item">
           <div class="row">
@@ -586,6 +655,7 @@ async function showStudentStatus() {
             ${badge(r.status)}
           </div>
           <div class="value">${r.pickup} → ${r.dropoff}</div>
+          ${when}
           <div class="text-muted" style="margin-top:4px">🚌 ${busLabel}</div>
         </div>`;
     });
@@ -646,6 +716,7 @@ async function showPendingRequests() {
         <div class="value">${r.student_name} (Roll: ${r.roll_number})</div>
         <div class="text-muted">${r.hostel} · Room ${r.room} · ${r.phone}</div>
         <div style="margin-top:6px;font-weight:600">${r.pickup} → ${r.dropoff}</div>
+        ${r.required_time ? `<div class="text-muted">⏰ Needed by: ${new Date(r.required_time).toLocaleString()}</div>` : ''}
         <div class="btn-group">
           <button class="btn btn-success btn-sm" onclick="decideRequest(${r.request_number},'approve')">✅ Approve</button>
           <button class="btn btn-danger btn-sm" onclick="decideRequest(${r.request_number},'reject')">❌ Reject</button>
@@ -727,7 +798,7 @@ function showRegisterBus() {
   render(`
     <a class="back-link" onclick="showBusSchedulerPortal()">← Back</a>
     <div class="card">
-      <h2><span class="icon">➕</span> Register New Bus</h2>
+      <h2><span class="icon">➕</span> Register New Vehicle</h2>
       <div id="alert"></div>
       <label>Route Pickup</label>
       <select id="bus_pickup">
@@ -739,7 +810,12 @@ function showRegisterBus() {
       </select>
       <label>Max Capacity</label>
       <input type="number" id="bus_cap" value="20" min="1" max="30">
-      <button class="btn btn-primary" onclick="registerBus()">Register Bus</button>
+      <label>Vehicle Type</label>
+      <select id="bus_type">
+        <option value="bus">🚌 Bus (large groups)</option>
+        <option value="van">🚐 Van (small groups)</option>
+      </select>
+      <button class="btn btn-primary" onclick="registerBus()">Register Vehicle</button>
     </div>
   `);
 }
@@ -748,13 +824,14 @@ async function registerBus() {
   const pickup = parseInt(document.getElementById('bus_pickup').value);
   const dropoff = parseInt(document.getElementById('bus_dropoff').value);
   const cap = parseInt(document.getElementById('bus_cap').value);
+  const vehicle_type = document.getElementById('bus_type').value;
   if (pickup === dropoff) return showAlert('alert', 'Pickup and dropoff must differ.', 'error');
   if (cap < 1 || cap > 30) return showAlert('alert', 'Capacity must be 1–30.', 'error');
 
   try {
     const data = await apiCall('POST', '/api/buses',
-      { route_pickup: pickup, route_dropoff: dropoff, max_capacity: cap }, true);
-    showAlert('alert', `Bus #${data.bus_number} registered: ${locName(pickup)} → ${locName(dropoff)} (cap: ${cap})`, 'success');
+      { route_pickup: pickup, route_dropoff: dropoff, max_capacity: cap, vehicle_type }, true);
+    showAlert('alert', `Vehicle #${data.bus_number} registered: ${locName(pickup)} → ${locName(dropoff)} (cap: ${cap})`, 'success');
     setTimeout(showBusSchedulerPortal, 1200);
   } catch (e) {
     showAlert('alert', e.message, 'error');
@@ -793,20 +870,33 @@ async function showBusSchedule(back = 'showBusSchedulerPortal') {
   buses.forEach(bus => {
     const pct = bus.capacity ? Math.round((bus.assigned / bus.capacity) * 100) : 0;
     const color = pct >= 80 ? 'var(--danger)' : pct >= 50 ? 'var(--warn)' : 'var(--accent)';
+    const icon = bus.vehicle_type === 'van' ? '🚐' : '🚌';
+    const stateCls = bus.state === 'AVAILABLE' ? 'badge-approved'
+      : (bus.state === 'DISPATCHED' || bus.state === 'ON_TRIP') ? 'badge-pending' : 'badge-rejected';
 
     html += `
       <div class="list-item">
         <div class="row">
-          <span style="font-weight:700">🚌 Bus #${bus.bus_number}</span>
-          ${pct >= 100 ? '<span class="badge badge-full">FULL</span>' : pct >= 80 ? '<span class="badge badge-warn">80%+</span>' : ''}
+          <span style="font-weight:700">${icon} ${bus.vehicle_type === 'van' ? 'Van' : 'Bus'} #${bus.bus_number}</span>
+          <span class="badge ${stateCls}">${bus.state}</span>
         </div>
         <div class="value">${bus.route}</div>
         <div class="capacity-bar"><div class="capacity-fill" style="width:${pct}%;background:${color}"></div></div>
-        <div class="text-muted">${bus.assigned} / ${bus.capacity} seats (${bus.capacity - bus.assigned} available)</div>
+        <div class="text-muted">${bus.assigned} / ${bus.capacity} seats (${bus.capacity - bus.assigned} available)${bus.state !== 'AVAILABLE' ? ' · auto-assign skips this vehicle' : ''}</div>
+        ${bus.state !== 'AVAILABLE' ? `<button class="btn btn-success btn-sm" onclick="setBusState(${bus.bus_number},'AVAILABLE')">✅ Set Available</button>` : `<button class="btn btn-danger btn-sm" onclick="setBusState(${bus.bus_number},'MAINTENANCE')">🔧 Mark Maintenance</button>`}
       </div>`;
   });
   html += '</div>';
   render(html);
+}
+
+async function setBusState(busNumber, state) {
+  try {
+    await apiCall('PATCH', `/api/buses/${busNumber}/state`, { state }, true);
+    showBusSchedule();
+  } catch (e) {
+    alert(e.message);
+  }
 }
 
 async function showRouteCapacity(back = 'showBusSchedulerPortal') {
@@ -844,6 +934,66 @@ async function showRouteCapacity(back = 'showBusSchedulerPortal') {
 // ---------- TIMETABLE (all roles) ----------
 function backLink(fn) { return `<a class="back-link" onclick="${fn}()">← Back</a>`; }
 
+// Shared timetable body: "next departure" banner + departures grouped by
+// route and vehicle type (buses first, then vans). Used by both the
+// logged-in timetable and the public login-screen view.
+// opts.emptyMsg: shown when rows is empty.
+// opts.nextRows: rows scanned for the next departure — defaults to rows;
+// override when rows only covers part of the week (e.g. today only) so the
+// banner can still point at tomorrow's first ride.
+function timetableBody(rows, opts = {}) {
+  const { emptyMsg = 'No departures scheduled.', nextRows = rows, now = new Date() } = opts;
+  // Banner is computed against nextRows so it still points ahead when rows
+  // only covers today ("no more departures today → next one is Monday 7:45").
+  const nextBanner = () => {
+    const next = nextDeparture(nextRows, now);
+    if (!next) return `<div class="alert alert-warn">No departures in the next 7 days.</div>`;
+    const when = next.daysAhead === 0 ? `today at ${to12h(next.departure_time)}` : `on ${next.weekday} at ${to12h(next.departure_time)}`;
+    const veh = (next.vehicle_type === 'van' || /van/i.test(next.label || '')) ? 'Van' : 'Bus';
+    return `<div class="alert alert-info">⏭️ Next departure: <strong>${when}</strong> — ${veh} #${next.bus_number} · ${next.route}</div>`;
+  };
+  if (!rows.length) {
+    return nextBanner() + `<div class="empty-state"><div class="icon">🕒</div><p>${emptyMsg}</p></div>`;
+  }
+  let html = nextBanner();
+
+  // Group departures by route AND vehicle type so Sunday vans appear as
+  // their own line, separate from the Mon-Sat buses on the same route.
+  const groups = new Map();
+  rows.forEach(s => {
+    const isVan = s.vehicle_type === 'van' || /van/i.test(s.label || '');
+    const key = s.route + (isVan ? '::van' : '::bus');
+    if (!groups.has(key)) groups.set(key, { route: s.route, isVan, departures: [] });
+    groups.get(key).departures.push(s);
+  });
+
+  // Buses first, then vans, each group ordered by time.
+  [...groups.values()]
+    .sort((a, b) => (a.isVan - b.isVan) || a.route.localeCompare(b.route))
+    .forEach(g => {
+      g.departures.sort((a, b) => a.departure_time.localeCompare(b.departure_time));
+      const icon = g.isVan ? '🚐' : '🚌';
+      const veh = g.isVan ? 'Van' : 'Bus';
+      const label0 = g.departures[0].label || '';
+      const days = g.isVan ? 'Sunday' : (label0.includes('·') ? label0.split('·').pop().trim() : (label0 || 'Daily'));
+      html += `
+      <div class="list-item">
+        <div class="row">
+          <span style="font-weight:700;font-size:1.05rem">${icon} ${g.route}</span>
+          <span class="text-muted">${days}</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px">`;
+      g.departures.forEach(s => {
+        const full = s.seats_available <= 0;
+        const seats = full ? 'FULL' : `${s.seats_available} left`;
+        html += `<span class="tt-chip${full ? ' full' : ''}" title="${veh} #${s.bus_number} — ${seats}">🕒 ${to12h(s.departure_time)}<span class="text-muted" style="margin-left:6px">${icon}#${s.bus_number} · ${seats}</span></span>`;
+      });
+      html += `</div></div>`;
+    });
+  return html;
+}
+
+// Full weekly timetable for any logged-in role.
 async function showTimetable(back) {
   back = back || 'showLogin';
   render(backLink(back) + `<div class="card"><h2><span class="icon">🕒</span> Bus Timetable</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
@@ -853,30 +1003,111 @@ async function showTimetable(back) {
   } catch (e) {
     return render(backLink(back) + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
   }
-  let html = `
-    ${backLink(back)}
-    <div class="card">
-      <h2><span class="icon">🕒</span> Bus Timetable</h2>
-  `;
-  if (!rows.length) {
-    html += `<div class="empty-state"><div class="icon">🕒</div><p>No departures scheduled yet.</p></div>`;
+  render(backLink(back) + `<div class="card"><h2><span class="icon">🕒</span> Bus Timetable</h2>${timetableBody(rows, { emptyMsg: 'No departures scheduled yet.' })}</div>`);
+}
+
+// ---------- PUBLIC TIMETABLE LIVE REFRESH ----------
+// Polls the public endpoint every 60s and repaints ONLY the timetable body,
+// so the hostel-gate screen stays flicker-free and keeps its scroll position.
+// A generation counter discards in-flight fetches if the user navigates away
+// (render() stops the poller, so no stray timer ever survives a screen change).
+const PUBLIC_TT_REFRESH_MS = 60000;
+let publicTTTimer = null;
+let publicTTMode = null;      // 'today' | 'week' (null behaves as today)
+let publicTTData = null;      // latest fetched schedule rows
+let publicTTGen = 0;          // bumped on every stop; stale fetches bail out
+let publicTTVisibilityHooked = false;
+
+function stopPublicTimetableRefresh() {
+  if (publicTTTimer) { clearInterval(publicTTTimer); publicTTTimer = null; }
+  // Bump the generation so any in-flight refresh writes nothing. Last fetched
+  // data is deliberately KEPT: showPublicTimetable sets it right before its
+  // final render(), and a fresh view always overwrites it before painting.
+  publicTTGen++;
+}
+
+function paintPublicTimetableBody() {
+  const host = document.getElementById('public-tt-body');
+  if (!host) return;
+  const now = new Date();
+  const rows = publicTTData || [];
+  const bodyRows = publicTTMode === 'week' ? rows : rows.filter(s => runsOnDay(s.label, now.getDay()));
+  const emptyMsg = publicTTMode === 'week'
+    ? 'No departures scheduled yet.'
+    : 'No more departures today — check the full week.';
+  const dayHeader = document.getElementById('public-tt-day');
+  if (dayHeader) dayHeader.textContent = `📅 ${WEEKDAY_NAMES[now.getDay()]} · times shown for your device's timezone`;
+  host.innerHTML = timetableBody(bodyRows, { emptyMsg, nextRows: rows, now });
+}
+
+async function refreshPublicTimetable() {
+  const gen = publicTTGen;
+  try {
+    const data = await apiCall('GET', '/api/timetable/public');
+    if (gen !== publicTTGen) return;              // screen changed mid-flight
+    publicTTData = data.schedule || [];
+    if (document.getElementById('public-tt-body')) paintPublicTimetableBody();
+  } catch {
+    if (gen !== publicTTGen) return;
+    const host = document.getElementById('public-tt-body');
+    // Keep the last good data on screen; offer a manual retry for transient
+    // failures (cold starts after ~15 idle minutes can exceed timeouts).
+    if (host && !host.querySelector('.live-retry')) {
+      host.insertAdjacentHTML('afterbegin',
+        `<div class="alert alert-warn live-retry">Live update failed — showing last known schedule.
+         <a class="forgot-link" style="display:inline;margin:0 0 0 6px" onclick="refreshPublicTimetable()">Retry</a></div>`);
+    }
   }
-  rows.forEach(s => {
-    const seatBadge = s.seats_available > 0
-      ? `<span class="badge badge-approved">${s.seats_available} seats left</span>`
-      : `<span class="badge badge-full">FULL</span>`;
-    html += `
-      <div class="list-item">
-        <div class="row">
-          <span style="font-weight:700;font-size:1.05rem">🕒 ${s.departure_time}</span>
-          ${seatBadge}
-        </div>
-        <div class="value">🚌 Bus #${s.bus_number} · ${s.route}</div>
-        ${s.label ? `<div class="text-muted">${s.label}</div>` : ''}
-      </div>`;
-  });
-  html += '</div>';
-  render(html);
+}
+
+function startPublicTimetableRefresh() {
+  // Defensive clear (render() already stopped us); no gen bump here — data
+  // was just set by the caller and there is no in-flight fetch to invalidate.
+  if (publicTTTimer) { clearInterval(publicTTTimer); publicTTTimer = null; }
+  publicTTTimer = setInterval(refreshPublicTimetable, PUBLIC_TT_REFRESH_MS);
+  // Browsers throttle timers in background tabs; refresh immediately when the
+  // hostel-gate tab becomes visible again so data is never minutes stale.
+  if (!publicTTVisibilityHooked) {
+    publicTTVisibilityHooked = true;
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && publicTTTimer) refreshPublicTimetable();
+    });
+  }
+}
+
+// Today / Full-week toggle repaints in place — no refetch, no flash.
+function switchPublicTimetableMode(mode) {
+  if (!document.getElementById('public-tt-body')) return showPublicTimetable(mode);
+  publicTTMode = mode;
+  paintPublicTimetableBody();
+}
+
+// Public timetable on the login screen — no account needed. Defaults to
+// today's departures (computed in the viewer's local time) with a toggle
+// for the full week. Auto-refreshes every 60s for live seat counts.
+async function showPublicTimetable(mode = 'today') {
+  render(`<a class="back-link" onclick="showLogin()">← Back to Login</a><div class="card"><h2><span class="icon">🕒</span> Bus & Van Timetable</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let rows;
+  try {
+    rows = (await apiCall('GET', '/api/timetable/public')).schedule;
+  } catch (e) {
+    return render(`<a class="back-link" onclick="showLogin()">← Back to Login</a><div class="card"><div class="alert alert-error">${e.message}</div><button class="btn btn-outline btn-sm" onclick="showPublicTimetable('${mode}')">↻ Retry</button></div>`);
+  }
+  publicTTMode = mode;
+  publicTTData = rows;
+  render(`<a class="back-link" onclick="showLogin()">← Back to Login</a>
+    <div class="card">
+      <h2><span class="icon">🕒</span> Bus &amp; Van Timetable
+        <span class="text-muted" style="font-size:.7rem;font-weight:400">· live, refreshes every minute</span></h2>
+      <div class="text-muted" id="public-tt-day"></div>
+      <div class="btn-group">
+        <button class="btn btn-sm ${mode === 'today' ? 'btn-primary' : 'btn-outline'}" onclick="switchPublicTimetableMode('today')">Today</button>
+        <button class="btn btn-sm ${mode === 'week' ? 'btn-primary' : 'btn-outline'}" onclick="switchPublicTimetableMode('week')">Full week</button>
+      </div>
+      <div id="public-tt-body"></div>
+    </div>`);
+  paintPublicTimetableBody();                     // initial paint with fresh data
+  startPublicTimetableRefresh();
 }
 
 async function showTimetableEditor(back) {
@@ -897,18 +1128,19 @@ async function showTimetableEditor(back) {
     <div class="card">
       <h2><span class="icon">➕</span> Add Departure</h2>
       <div id="alert"></div>`;
+  const vanBusNumbers = new Set(schedule.filter(s => s.vehicle_type === 'van' || /van/i.test(s.label || '')).map(s => s.bus_number));
   if (!buses.length) {
     html += `<div class="alert alert-warn">Register a bus first — timetable entries attach to buses.</div>`;
   } else {
     html += `
-      <label>Bus</label>
+      <label>Vehicle</label>
       <select id="tt_bus">
-        ${buses.map(b => `<option value="${b.bus_number}">Bus #${b.bus_number} — ${b.route}</option>`).join('')}
+        ${buses.map(b => `<option value="${b.bus_number}">${b.vehicle_type === 'van' ? '🚐 Van' : (vanBusNumbers.has(b.bus_number) ? '🚐 Van' : '🚌 Bus')} #${b.bus_number} — ${b.route}</option>`).join('')}
       </select>
       <label>Departure Time</label>
       <input type="time" id="tt_time">
       <label>Label (optional)</label>
-      <input type="text" id="tt_label" placeholder="e.g. Morning shuttle">
+      <input type="text" id="tt_label" placeholder="e.g. Morning shuttle · Mon-Sat">
       <button class="btn btn-primary" onclick="addScheduleEntry()">Add Departure</button>`;
   }
   html += `</div>
@@ -918,13 +1150,14 @@ async function showTimetableEditor(back) {
     html += `<div class="empty-state"><div class="icon">🕒</div><p>Nothing scheduled yet.</p></div>`;
   }
   schedule.forEach(s => {
+    const isVan = s.vehicle_type === 'van' || /van/i.test(s.label || '');
     html += `
       <div class="list-item">
         <div class="row">
-          <span style="font-weight:700">🕒 ${s.departure_time}</span>
+          <span style="font-weight:700">🕒 ${to12h(s.departure_time)} <span class="text-muted">(${s.departure_time})</span></span>
           <button class="btn btn-danger btn-sm" onclick="deleteScheduleEntry(${s.schedule_id})">🗑 Remove</button>
         </div>
-        <div class="value">🚌 Bus #${s.bus_number} · ${s.route}</div>
+        <div class="value">${isVan ? '🚐 Van' : '🚌 Bus'} #${s.bus_number} · ${s.route}</div>
         ${s.label ? `<div class="text-muted">${s.label}</div>` : ''}
       </div>`;
   });
