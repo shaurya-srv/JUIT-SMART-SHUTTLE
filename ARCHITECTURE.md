@@ -163,9 +163,12 @@ Status values: `PENDING_APPROVAL`, `APPROVED`, `REJECTED`, `COMPLETED`.
 4. Express 4 does not catch async throws — every route stays wrapped in `ah()`.
 
 ## 6. Known gaps / backlog
-- `POST /api/reset-password` is unauthenticated (roll number + new password
-  is enough) — must require the current password or an assisted flow before
-  real students onboard.
+- ~~`POST /api/reset-password` is unauthenticated~~ — **removed.** Student
+  passwords are admin-managed: bulk import with a default password, forced
+  one-time change at first login (`students.must_change_password`, enforced in
+  login and on every student request via the `mcp` token claim), logged-in
+  change via `PUT /api/students/password`, and admin-only reset via
+  `POST /api/admin/students/:roll/password` (also re-forces the change).
 - No login rate limiting (brute-force protection for staff passwords).
 - `SHUTTLE_DB_PASS` rotation pending (old password appeared in chat).
 

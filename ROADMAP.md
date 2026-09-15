@@ -20,7 +20,7 @@
 | Dynamic active-trip insertion (FR-16–17) | ❌ | Needs the trips entity |
 | Conductor mode & walk-ins (§4.5, §7.15–7.17, WR-01–07) | ❌ | Role model ready to extend |
 | Live GPS tracking (§7.18–7.26) | ❌ | Highest-risk PRD area (their own backlog flags it) |
-| Non-functional requirements (§8) | ✅ / 🔶 | Core NFRs met; rate limiting & reset-password hardening outstanding |
+| Non-functional requirements (§8) | ✅ / 🔶 | Core NFRs met; reset hardening **done** — rate limiting outstanding |
 
 ---
 
@@ -115,7 +115,7 @@
 | Vercel deploy + health monitoring | ✅ | `GET /api/health`; git-push deploys |
 | UI / API / business-rule separation | ✅ | Business rules in `server/lib/service.js` |
 | Traceable scheduling decisions | 🟡 | Reports exist; decision audit arrives with the optimizer |
-| **Password reset hardening** | 🔶 | `POST /api/reset-password` is still unauthenticated (roll number + new password) — **must fix before onboarding students** |
+| **Password reset hardening** | ✅ | Public reset **removed**; admin-managed passwords: bulk import, default password, forced first-login change (`must_change_password`), admin-only reset |
 | **Login rate limiting** | ❌ | Brute-force protection for staff passwords |
 | **DB password rotation** | ❌ | Old credential appeared in chat; rotate in Supabase + Vercel |
 
@@ -124,9 +124,9 @@
 ## 7. Recommended Build Order
 
 ### Phase 0 — Ship what exists (now)
-1. Apply migrations **002, 003, 004** in Supabase SQL Editor (idempotent; 004 adds dispatch columns + van backfill).
+1. Apply migrations **002–005** in Supabase SQL Editor (idempotent; or the combined `server/migrations/apply_all_pending.sql`).
 2. Deploy (`git push`), verify `/api/timetable/public` returns 24 departures and the login-screen live view works.
-3. Security quick wins before students arrive: protect reset-password, add login rate limiting, rotate `SHUTTLE_DB_PASS`.
+3. Security quick wins before students arrive: ~~protect reset-password~~ (done — admin-managed), add login rate limiting, rotate `SHUTTLE_DB_PASS`.
 
 ### Phase 1 — Dispatch engine v1 (FR-09/10/11, §6.3–6.11, finishes 7.13)
 - Consume `required_time`: pool APPROVED requests by (direction, route); sort by earliest deadline.

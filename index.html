@@ -80,7 +80,7 @@
     margin-bottom: 4px;
     margin-top: 12px;
   }
-  input, select {
+  input, select, textarea {
     width: 100%;
     padding: 10px 12px;
     border: 1.5px solid var(--border);
@@ -88,12 +88,14 @@
     font-size: .95rem;
     transition: border-color .2s;
     background: #fafafa;
+    font-family: inherit;
   }
-  input:focus, select:focus {
+  input:focus, select:focus, textarea:focus {
     outline: none;
     border-color: var(--primary);
     box-shadow: 0 0 0 3px rgba(26,115,232,.15);
   }
+  textarea { resize: vertical; min-height: 96px; }
   .btn {
     display: inline-flex;
     align-items: center;
@@ -424,7 +426,6 @@ function showLogin() {
         <button class="password-toggle" onclick="togglePass()">👁</button>
       </div>
       <button class="btn btn-primary" onclick="doLogin()">Login</button>
-      <a class="forgot-link" onclick="showResetPassword()">🔑 Forgot Password?</a>
       <hr class="divider">
       <button class="btn btn-outline" onclick="showRegister()">📝 Register New Student</button>
       <a class="forgot-link" onclick="showPublicTimetable()">🕒 Bus &amp; Van Timetable — no login needed</a>
@@ -455,9 +456,10 @@ async function doLogin() {
   try {
     const data = await apiCall('POST', '/api/login', payload);
     session = data.role === 'student'
-      ? { role: 'student', token: data.token, roll: data.roll_number, name: data.name }
+      ? { role: 'student', token: data.token, roll: data.roll_number, name: data.name, must_change: !!data.must_change_password }
       : { role: data.role, token: data.token };
     saveSession();
+    if (session.role === 'student' && data.must_change_password) return showForceChangePassword();
     if (session.role === 'student') showStudentPortal();
     else if (session.role === 'guard') showGuardPortal();
     else if (session.role === 'admin') showAdminPortal();
@@ -472,45 +474,46 @@ function showAlert(id, msg, type) {
   if (el) el.innerHTML = `<div class="alert alert-${type}">${msg}</div>`;
 }
 
-// ---------- RESET PASSWORD ----------
-function showResetPassword() {
+// ---------- FIRST-LOGIN PASSWORD CHANGE (forced, one-time) ----------
+// Passwords are admin-managed: students change their own password only here,
+// once, after the admin issues them a default. No self-service reset exists.
+function showForceChangePassword() {
   render(`
-    <a class="back-link" onclick="showLogin()">← Back to Login</a>
+    <div class="welcome-bar"><span>🔐 <strong>Set your password</strong></span></div>
     <div class="card">
-      <h2><span class="icon">🔑</span> Reset Password</h2>
+      <h2><span class="icon">🔐</span>Change Your Password</h2>
+      <p style="margin:4px 0 8px">Your account was created by the admin with a default password. Choose a new password to continue — you won't be asked again. If you ever forget it, ask the admin to reset it.</p>
       <div id="alert"></div>
-      <label>Roll Number</label>
-      <input type="number" id="reset_roll" placeholder="Enter your roll number">
-      <label>New Password</label>
       <div class="password-wrap">
-        <input type="password" id="reset_pass" placeholder="Enter new password">
-        <button class="password-toggle" onclick="toggleResetPass()">👁</button>
+        <label>New Password</label>
+        <input type="password" id="fc_pass" placeholder="Min 8 characters">
+        <button class="password-toggle" onclick="toggleFcPass()">👁</button>
       </div>
-      <label>Confirm Password</label>
-      <input type="password" id="reset_pass2" placeholder="Confirm new password">
-      <button class="btn btn-primary" onclick="doResetPassword()">Reset Password</button>
+      <label>Confirm New Password</label>
+      <input type="password" id="fc_pass2" placeholder="Repeat new password">
+      <button class="btn btn-primary" onclick="doForceChangePassword()">Save &amp; Continue</button>
+      <hr class="divider">
+      <button class="btn btn-outline btn-sm" onclick="doLogout()" style="width:100%">🚪 Logout</button>
     </div>
   `);
 }
 
-function toggleResetPass() {
-  const p = document.getElementById('reset_pass');
+function toggleFcPass() {
+  const p = document.getElementById('fc_pass');
   p.type = p.type === 'password' ? 'text' : 'password';
 }
 
-async function doResetPassword() {
-  const roll = parseInt(document.getElementById('reset_roll').value);
-  const pass = document.getElementById('reset_pass').value;
-  const pass2 = document.getElementById('reset_pass2').value;
-  if (!roll) return showAlert('alert', 'Please enter your roll number.', 'error');
-  if (!pass) return showAlert('alert', 'Please enter a new password.', 'error');
-  if (pass.length < 4) return showAlert('alert', 'Password must be at least 4 characters.', 'error');
+async function doForceChangePassword() {
+  const pass = document.getElementById('fc_pass').value;
+  const pass2 = document.getElementById('fc_pass2').value;
+  if (pass.length < 8) return showAlert('alert', 'Password must be at least 8 characters.', 'error');
   if (pass !== pass2) return showAlert('alert', 'Passwords do not match.', 'error');
-
   try {
-    await apiCall('POST', '/api/reset-password', { roll_number: roll, new_password: pass });
-    showAlert('alert', 'Password reset successful! You can now login.', 'success');
-    setTimeout(showLogin, 1500);
+    await apiCall('PUT', '/api/students/password', { new_password: pass }, true);
+    session.must_change = false;
+    saveSession();
+    showAlert('alert', 'Password saved! Welcome aboard. 🚌', 'success');
+    setTimeout(showStudentPortal, 1200);
   } catch (e) {
     showAlert('alert', e.message, 'error');
   }
@@ -1206,6 +1209,7 @@ function showAdminPortal() {
       <h2><span class="icon">⚙️</span> Admin Dashboard</h2>
       <div class="menu-grid">
         <div class="menu-btn" onclick="showStaffManagement()"><span class="menu-icon">🔑</span>Staff Accounts</div>
+        <div class="menu-btn" onclick="showStudentAccounts()"><span class="menu-icon">🎓</span>Students &amp; Passwords</div>
         <div class="menu-btn" onclick="showTimetableEditor('showAdminPortal')"><span class="menu-icon">🕒</span>Edit Timetable</div>
         <div class="menu-btn" onclick="showBusSchedule('showAdminPortal')"><span class="menu-icon">📊</span>Bus Schedule</div>
         <div class="menu-btn" onclick="doAutoAssign('showAdminPortal')"><span class="menu-icon">🔄</span>Auto-Assign</div>
@@ -1268,6 +1272,99 @@ async function changeStaffPassword() {
   }
 }
 
+// ---------- ADMIN: STUDENT ACCOUNTS ----------
+// Mass import + password resets — the only way students get or regain access.
+async function showStudentAccounts() {
+  render(backLink('showAdminPortal') + `<div class="card"><h2><span class="icon">🎓</span>Students &amp; Passwords</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let data;
+  try {
+    data = await apiCall('GET', '/api/admin/students?limit=200', undefined, true);
+  } catch (e) {
+    return render(backLink('showAdminPortal') + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
+  render(backLink('showAdminPortal') + `
+    <div class="card">
+      <h2><span class="icon">🎓</span>Students &amp; Passwords</h2>
+      <p style="margin:4px 0 0">${data.total} total · <strong>${data.on_default_password}</strong> still on a default password</p>
+      <input type="search" id="stu_q" placeholder="Search roll number or name…" oninput="filterStudentRows(this.value)" style="margin-top:8px">
+    </div>
+    <div class="card">
+      <h2><span class="icon">📤</span>Bulk Import Students</h2>
+      <p style="margin:4px 0 8px">One student per line: <strong>roll number, name</strong> — room, hostel, phone optional. Existing roll numbers are skipped, never overwritten.</p>
+      <textarea id="import_list" rows="5" placeholder="261030195, Aarav Sharma, 214, Peach Tree, 9876543210\n261030196, Diya Verma"></textarea>
+      <div class="password-wrap" style="margin-top:8px">
+        <label>Default password (each student must change it at first login)</label>
+        <input type="text" id="import_pass" placeholder="Min 8 characters — blank = Pass@&lt;year&gt;">
+      </div>
+      <button class="btn btn-primary" onclick="doBulkImport()">Import Students</button>
+      <div id="import_result"></div>
+    </div>
+    <div class="card">
+      <h2><span class="icon">🔍</span>Student List</h2>
+      <div id="stu_rows"></div>
+    </div>`);
+  renderStudentRows(data.students);
+}
+
+function renderStudentRows(students) {
+  const el = document.getElementById('stu_rows');
+  if (!students.length) { el.innerHTML = '<div class="empty-state"><div class="icon">👥</div><p>No students yet — use Bulk Import above.</p></div>'; return; }
+  el.innerHTML = students.map(s => `
+    <div class="list-item student-row" data-name="${(s.name || '').toLowerCase()}" data-roll="${s.roll_number}">
+      <div class="row">
+        <span class="value"><strong>${s.roll_number}</strong> — ${s.name}</span>
+        <span class="badge ${s.on_default_password ? 'badge-rejected' : 'badge-approved'}">${s.on_default_password ? 'default password' : 'active'}</span>
+      </div>
+      <div class="row" style="margin-top:2px">
+        <span class="label">${s.hostel || ''}${s.room ? ' · Room ' + s.room : ''}</span>
+        <button class="btn btn-outline btn-sm" onclick="doResetStudentPassword(${s.roll_number}, '${(s.name || '').replace(/'/g, "\\'")}')">🔑 Reset password</button>
+      </div>
+    </div>`).join('');
+}
+
+function filterStudentRows(q) {
+  q = (q || '').trim().toLowerCase();
+  document.querySelectorAll('.student-row').forEach(el => {
+    const hit = !q || el.dataset.roll.includes(q) || el.dataset.name.includes(q);
+    el.style.display = hit ? '' : 'none';
+  });
+}
+
+async function doBulkImport() {
+  const raw = document.getElementById('import_list').value.trim();
+  const pass = document.getElementById('import_pass').value;
+  if (!raw) return showAlert('import_result', 'Paste at least one student line.', 'error');
+  const students = raw.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
+    const parts = line.split(',').map(p => p.trim());
+    return { roll_number: parts[0], name: parts[1] || '', room: parts[2] || '', hostel: parts[3] || '', phone: parts[4] || '' };
+  });
+  for (const s of students) {
+    if (!/^\d+$/.test(String(s.roll_number))) return showAlert('import_result', `Roll number must be numeric: "${s.roll_number}"`, 'error');
+    if (!s.name) return showAlert('import_result', `Missing name for roll number ${s.roll_number}`, 'error');
+  }
+  try {
+    const res = await apiCall('POST', '/api/admin/students', { students, default_password: pass || undefined }, true);
+    document.getElementById('import_result').innerHTML =
+      `<div class="alert alert-success">✅ Imported ${res.imported} student(s)${res.skipped_existing ? ` · skipped ${res.skipped_existing} already existing` : ''}. Share the default password in person — each student must change it at first login.</div>`;
+    document.getElementById('import_list').value = '';
+  } catch (e) {
+    showAlert('import_result', e.message, 'error');
+  }
+}
+
+async function doResetStudentPassword(roll, name) {
+  const pass = prompt(`Reset password for ${name || roll}.\nEnter a new password (min 8 chars) — or leave blank to set the default. The student must change it at next login.`);
+  if (pass === null) return;
+  if (pass && pass.length < 8) return alert('Password must be at least 8 characters.');
+  try {
+    await apiCall('POST', `/api/admin/students/${roll}/password`, { new_password: pass || undefined }, true);
+    alert(`Password reset for ${name || roll}. Share it in person — they must change it at next login.`);
+    showStudentAccounts();
+  } catch (e) {
+    alert('Reset failed: ' + e.message);
+  }
+}
+
 // ---------- LOGOUT ----------
 function doLogout() {
   clearSession();
@@ -1283,7 +1380,10 @@ if (session) {
       // Token may still be valid for non-student roles (mine is student-only).
       apiCall('GET', '/api/requests', undefined, true)
         .then(() => { if (session.role === 'guard') showGuardPortal(); else if (session.role === 'admin') showAdminPortal(); else showBusSchedulerPortal(); })
-        .catch(() => { clearSession(); showLogin(); });
+        .catch(() => {
+          if (session.role === 'student' && session.must_change) return showForceChangePassword();
+          clearSession(); showLogin();
+        });
     });
 } else {
   showLogin();

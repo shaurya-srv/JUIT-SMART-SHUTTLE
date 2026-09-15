@@ -12,10 +12,10 @@ assigns them to buses with live capacity tracking and a departure timetable.
 | Role | Capabilities |
 |---|---|
 | Student | Register, login, create pickup requests, track status, view timetable with seats left |
-| Anyone | Check the **public timetable** from the login screen — today's departures, next ride, live seat counts (no login) |
-| Guard | Approve/reject pending requests, complete rides (frees the seat), view all lists |
+| Anyone | Check the **public timetable** from the login screen — today's departures, next ride, live seat counts (no login) || Guard | Approve/reject pending requests, complete rides (frees the seat), view all lists |
 | Scheduler | Register buses, auto-assign approved requests, route capacity report, edit departure timetable |
 | Admin | Everything the scheduler can do + staff password management |
+| Admin | **Manage student accounts**: bulk import, default passwords, forced first-login change, and the only password-reset path |
 
 Request lifecycle: `PENDING_APPROVAL → APPROVED → COMPLETED` (or `REJECTED`).
 
@@ -63,6 +63,9 @@ project settings (Production). Fallback: `npx vercel --prod`.
 
 - Passwords hashed with PBKDF2-HMAC-SHA256 (60k iterations, per-row salt);
   legacy plaintext rows upgrade on first login.
+- **Student passwords are admin-managed**: accounts are mass-imported with a
+  shared default password that must be changed once at first login; there is
+  **no public password reset** — forgotten passwords go through the admin.
 - JWT bearer auth, 8-hour expiry; role checks per route.
 - Parameterized queries everywhere; 4 KB body limit; async routes wrapped so
   DB errors can't kill the serverless function.

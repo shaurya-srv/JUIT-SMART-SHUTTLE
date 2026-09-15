@@ -40,6 +40,13 @@ function authenticate(req, res, next) {
   }
   try {
     const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+    // Admin-managed passwords: a student still on the issued default can do
+    // exactly one authenticated thing — change it. Everything else 403s
+    // until the change is made (a fresh login then issues a clean token).
+    if (payload.role === 'student' && payload.mcp
+        && req.path !== '/api/students/password') {
+      return res.status(403).json({ error: 'password change required', must_change_password: true });
+    }
     req.session = payload;
     next();
   } catch {
@@ -80,7 +87,7 @@ app.post('/api/login', ah(async (req, res) => {
       return res.status(400).json({ error: 'roll_number is required for students' });
     }
     const [rows] = await db.query(
-      'SELECT password, name FROM students WHERE roll_number = $1', [roll_number]);
+      'SELECT password, name, must_change_password FROM students WHERE roll_number = $1', [roll_number]);
     if (!rows.length || !pwVerify(password, rows[0].password)) {
       return res.status(401).json({ error: 'invalid credentials' });
     }
@@ -89,8 +96,12 @@ app.post('/api/login', ah(async (req, res) => {
       const hashed = pwHash(password);
       await db.query('UPDATE students SET password = $1 WHERE roll_number = $2', [hashed, roll_number]);
     }
-    const token = jwt.sign({ role: 'student', roll_number }, JWT_SECRET, { expiresIn: '8h' });
-    return res.json({ token, role: 'student', roll_number, name: rows[0].name });
+    // Passwords are admin-managed: a student still on the imported default
+    // gets one forced change at first login (frontend enforces the flow,
+    // server enforces it again on every authenticated request).
+    const mustChange = rows[0].must_change_password === true;
+    const token = jwt.sign({ role: 'student', roll_number, mcp: mustChange }, JWT_SECRET, { expiresIn: '8h' });
+    return res.json({ token, role: 'student', roll_number, name: rows[0].name, must_change_password: mustChange });
   }
 
   if (role === 'guard' || role === 'scheduler' || role === 'admin') {
@@ -129,21 +140,28 @@ app.post('/api/register', ah(async (req, res) => {
   res.status(201).json({ registered: true });
 }));
 
-app.post('/api/reset-password', ah(async (req, res) => {
-  const { roll_number, new_password } = req.body;
-  if (!roll_number || !new_password) {
-    return res.status(400).json({ error: 'roll_number and new_password are required' });
+// SECURITY: the old unauthenticated POST /api/reset-password is gone.
+// Knowing a roll number no longer lets anyone take over the account —
+// password resets go through the admin (POST /api/admin/students/:roll/password),
+// and students change their own password only while logged in (below).
+
+// Student changes their own password (also satisfies the first-login
+// forced change). Requires a fresh login — never takes the old password
+// over an unauthenticated route.
+app.put('/api/students/password', authenticate, requireRole('student'), ah(async (req, res) => {
+  const { new_password } = req.body;
+  if (!new_password) {
+    return res.status(400).json({ error: 'new_password is required' });
   }
-  if (new_password.length < 4) {
-    return res.status(400).json({ error: 'password must be at least 4 characters' });
+  if (String(new_password).length < 8) {
+    return res.status(400).json({ error: 'password must be at least 8 characters' });
   }
-  const [exists] = await db.query('SELECT COUNT(*)::int AS cnt FROM students WHERE roll_number = $1', [roll_number]);
-  if (exists[0].cnt === 0) {
-    return res.status(404).json({ error: 'student not found' });
-  }
-  const hashed = pwHash(new_password);
-  await db.query('UPDATE students SET password = $1 WHERE roll_number = $2', [hashed, roll_number]);
-  res.json({ reset: true });
+  const [, rowCount] = await db.query(
+    'UPDATE students SET password = $1, must_change_password = FALSE, password_changed_at = now() '
+    + 'WHERE roll_number = $2',
+    [pwHash(new_password), req.session.roll_number]);
+  if (!rowCount) return res.status(404).json({ error: 'student not found' });
+  res.json({ changed: true });
 }));
 
 // ============================================================
@@ -505,6 +523,118 @@ app.post('/api/admin/staff-password', authenticate, requireRole('admin'), ah(asy
     'UPDATE credentials SET password = $1 WHERE role = $2', [pwHash(new_password), role]);
   if (!rowCount) return res.status(404).json({ error: 'role not found' });
   res.json({ role, updated: true });
+}));
+
+// ============================================================
+// Admin: student account management (mass import + password resets).
+// The only path students ever get or regain a password.
+// ============================================================
+
+app.get('/api/admin/students', authenticate, requireRole('admin'), ah(async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+  const [rows] = q
+    ? await db.query(
+        'SELECT roll_number, name, room_number, hostel_name, phone_number, must_change_password, password_changed_at '
+        + 'FROM students WHERE roll_number::text LIKE $1 OR name ILIKE $2 '
+        + 'ORDER BY roll_number LIMIT $3',
+        [q + '%', '%' + q + '%', limit])
+    : await db.query(
+        'SELECT roll_number, name, room_number, hostel_name, phone_number, must_change_password, password_changed_at '
+        + 'FROM students ORDER BY roll_number LIMIT $1', [limit]);
+  const [totals] = await db.query(
+    'SELECT COUNT(*)::int AS total, '
+    + "COUNT(*) FILTER (WHERE must_change_password)::int AS on_default_password FROM students");
+  res.json({
+    count: rows.length,
+    total: totals[0].total,
+    on_default_password: totals[0].on_default_password,
+    students: rows.map(r => ({
+      roll_number: r.roll_number,
+      name: r.name,
+      room: r.room_number,
+      hostel: r.hostel_name,
+      phone: r.phone_number,
+      on_default_password: r.must_change_password === true,
+      password_changed_at: r.password_changed_at,
+    })),
+  });
+}));
+
+const MAX_IMPORT_STUDENTS = 1000;
+
+// Bulk-import students with a shared default password they must replace
+// at first login. Existing roll numbers are skipped (never overwritten).
+app.post('/api/admin/students', authenticate, requireRole('admin'), ah(async (req, res) => {
+  const { students, default_password } = req.body || {};
+  if (!Array.isArray(students) || students.length === 0) {
+    return res.status(400).json({ error: 'students array is required' });
+  }
+  if (students.length > MAX_IMPORT_STUDENTS) {
+    return res.status(400).json({ error: `import at most ${MAX_IMPORT_STUDENTS} students at a time` });
+  }
+  if (default_password !== undefined && String(default_password).length < 8) {
+    return res.status(400).json({ error: 'default_password must be at least 8 characters' });
+  }
+
+  const seen = new Set();
+  const clean = [];
+  for (const s of students) {
+    const roll = parseInt(s && s.roll_number, 10);
+    const name = String((s && s.name) || '').trim();
+    const room = String((s && s.room) || '').trim();
+    const hostel = String((s && s.hostel) || '').trim();
+    const phone = String((s && s.phone) || '').trim();
+    if (!roll || roll < 1) {
+      return res.status(400).json({ error: `invalid roll_number in import list: ${JSON.stringify(s && s.roll_number)}` });
+    }
+    if (!name || name.length > 100 || room.length > 20 || hostel.length > 50 || phone.length > 20) {
+      return res.status(400).json({ error: `invalid or too-long fields for roll number ${roll}` });
+    }
+    if (seen.has(roll)) {
+      return res.status(400).json({ error: `duplicate roll number in import list: ${roll}` });
+    }
+    seen.add(roll);
+    clean.push([roll, name, room, hostel, phone]);
+  }
+
+  // One hash for everyone: the default is shared by design, and hashing
+  // per row would blow the serverless time budget on large imports.
+  const hash = pwHash(default_password || 'Pass@' + new Date().getFullYear());
+  const values = [];
+  const tuples = clean.map((row, i) => {
+    values.push(...row);
+    const b = i * 5;
+    return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$6,TRUE)`;
+  });
+  const [, rowCount] = await db.query(
+    'INSERT INTO students (roll_number, name, room_number, hostel_name, phone_number, password, must_change_password) '
+    + 'VALUES ' + tuples.join(',')
+    + ' ON CONFLICT (roll_number) DO NOTHING',
+    values);
+  const imported = rowCount || 0;
+  res.status(201).json({
+    imported,
+    skipped_existing: clean.length - imported,
+    default_password_used: default_password ? '(as provided)' : '(generated default)',
+  });
+}));
+
+// Admin resets one student's password: sets the default back and forces a
+// change at next login. This is THE forgot-password flow.
+app.post('/api/admin/students/:roll/password', authenticate, requireRole('admin'), ah(async (req, res) => {
+  const { new_password } = req.body || {};
+  const roll = parseInt(req.params.roll, 10);
+  if (!roll) return res.status(400).json({ error: 'invalid roll number' });
+  if (new_password !== undefined && String(new_password).length < 8) {
+    return res.status(400).json({ error: 'password must be at least 8 characters' });
+  }
+  const hash = pwHash(new_password || 'Pass@' + new Date().getFullYear());
+  const [, rowCount] = await db.query(
+    'UPDATE students SET password = $1, must_change_password = TRUE WHERE roll_number = $2',
+    [hash, roll]);
+  if (!rowCount) return res.status(404).json({ error: 'student not found' });
+  res.json({ roll, reset: true, must_change_password: true });
 }));
 
 // Central error handler — target of the ah() wrapper above.
