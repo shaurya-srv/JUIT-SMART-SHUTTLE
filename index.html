@@ -589,6 +589,7 @@ function showStudentPortal() {
         <div class="menu-btn" onclick="showCreateRequest()"><span class="menu-icon">🚗</span>Create Pickup Request</div>
         <div class="menu-btn" onclick="showStudentStatus()"><span class="menu-icon">📋</span>Check Request Status</div>
         <div class="menu-btn" onclick="showTimetable('showStudentPortal')"><span class="menu-icon">🕒</span>Bus Timetable</div>
+        <div class="menu-btn" onclick="showLiveBuses()"><span class="menu-icon">📍</span>Live Buses</div>
       </div>
       <hr class="divider">
       <button class="btn btn-outline btn-sm" onclick="doLogout()" style="width:100%">🚪 Logout</button>
@@ -652,6 +653,25 @@ async function showStudentStatus() {
   } else {
     // Your-ride card: the next approved+assigned request gets the big visual.
     const ride = rows.find(r => r.status === 'APPROVED' && r.bus);
+    // Live status for the confirmed ride: if that exact bus+departure is
+    // currently running, show where it is (or honestly say we can't see it).
+    // Never let a live-board failure break My Requests.
+    let liveHtml = '';
+    if (ride) {
+      try {
+        const board = await apiCall('GET', '/api/trips/active');
+        const t = (board.trips || []).find(x =>
+          x.bus_number === ride.bus && (!ride.departure || x.departure_time === ride.departure));
+        if (t) {
+          const phase = t.state === 'BOARDING' ? '👥 Boarding now'
+            : (t.state === 'DEPARTED' || t.state === 'EN_ROUTE') ? '🛣️ On the way'
+            : `🚦 ${t.state}`;
+          liveHtml = `<div class="text-muted" style="margin-top:4px">${phase} · ${fixLabel(t)} · <a onclick="showLiveBuses('showStudentStatus')" style="cursor:pointer;text-decoration:underline">live board</a></div>`;
+        } else {
+          liveHtml = `<div class="text-muted" style="margin-top:4px">🕐 Not running yet — check back near departure · <a onclick="showLiveBuses('showStudentStatus')" style="cursor:pointer;text-decoration:underline">live board</a></div>`;
+        }
+      } catch { /* board down → silently skip the live line */ }
+    }
     if (ride) {
       const icon = ride.vehicle_type === 'van' ? '🚐 Van' : '🚌 Bus';
       const depTime = ride.departure_label ||
@@ -666,6 +686,7 @@ async function showStudentStatus() {
             <div style="flex:1">
               <div style="font-weight:800;font-size:1.05rem">Your ride: ${icon} #${ride.bus}${depTime ? ` — the ${depTime} run` : ''}</div>
               <div class="text-muted">${ride.pickup} → ${ride.dropoff}${needBy ? ' · ' + needBy : ''}</div>
+              ${liveHtml}
             </div>
             <span class="badge badge-approved">CONFIRMED</span>
           </div>
@@ -689,6 +710,79 @@ async function showStudentStatus() {
   }
   html += '</div>';
   render(html);
+}
+
+// ---------- LIVE BUSES (Phase 3 step 3) ----------
+// Public live board: active trips with fresh/stale fixes. Auto-refreshes
+// every 30 s; the timer survives re-renders via a generation counter.
+let liveBusesGen = 0;
+let liveBusesTimer = null;
+
+function stopLiveBuses() {
+  liveBusesGen++;
+  if (liveBusesTimer) { clearInterval(liveBusesTimer); liveBusesTimer = null; }
+}
+
+function fixLabel(t) {
+  if (!t.fix) return '📍 No location shared';
+  if (t.fix_stale) return `📍 Last seen ${Math.max(1, Math.round(t.fix_age_seconds / 60))} min ago`;
+  return `📍 Live · updated ${t.fix_age_seconds}s ago`;
+}
+
+async function showLiveBuses(backTo) {
+  stopLiveBuses();
+  const gen = ++liveBusesGen;
+  const back = backTo || 'showStudentPortal';
+  render(backLink(back) + `<div class="card"><h2><span class="icon">📍</span>Live Buses</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let board;
+  try {
+    board = await apiCall('GET', '/api/trips/active');
+  } catch (e) {
+    return render(backLink(back) + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
+  if (gen !== liveBusesGen) return; // a newer render took over
+  let html = backLink(back) + `
+    <div class="card">
+      <h2><span class="icon">📍</span>Live Buses</h2>
+      <p class="text-muted" style="margin:4px 0 8px">Buses currently running. Auto-refreshes every 30 s.</p>`;
+  if (!board.trips.length) {
+    html += `<div class="empty-state"><div class="icon">🛑</div><p>No buses running right now.</p></div>`;
+  }
+  board.trips.forEach(t => {
+    const icon = t.vehicle_type === 'van' ? '🚐 Van' : '🚌 Bus';
+    const staleCls = t.fix_stale ? 'text-muted' : '';
+    html += `<div class="list-item">
+      <div class="row"><span class="value">${icon} #${t.bus_number} — ${t.route}</span><span class="badge badge-warn">${t.state}</span></div>
+      <div class="row"><span class="label ${staleCls}">${fixLabel(t)}</span><span class="label">${t.seats_available} seats left</span></div>
+      ${session && session.role === 'student'
+        ? `<div class="row"><span class="label">Request # to join:</span>
+             <span><input type="number" id="join_req_${t.trip_id}" placeholder="e.g. 1042" style="width:110px">
+             <button class="btn btn-primary btn-sm" onclick="doJoinTrip(${t.trip_id})">Join this bus</button></span></div>`
+        : ''}
+    </div>`;
+  });
+  html += '</div>';
+  render(html);
+  liveBusesTimer = setInterval(async () => {
+    if (liveBusesGen !== gen) return stopLiveBuses();
+    try {
+      board = await apiCall('GET', '/api/trips/active');
+      if (liveBusesGen !== gen) return;
+      showLiveBuses(back); // re-render with fresh data
+    } catch { /* keep the old paint; next tick retries */ }
+  }, 30000);
+}
+
+async function doJoinTrip(tripId) {
+  const el = document.getElementById('join_req_' + tripId);
+  const requestNumber = parseInt((el || {}).value);
+  if (!requestNumber) return showAlert('alert', 'Enter your approved request number.', 'error');
+  try {
+    const r = await apiCall('POST', `/api/trips/${tripId}/join`, { request_number: requestNumber }, true);
+    showAlert('alert', `✅ You're on ${r.bus_number === null ? 'the trip' : 'Bus #' + r.bus_number} — seats left: ${r.seats_left}.`, 'success');
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
+  }
 }
 
 // ---------- GUARD PORTAL ----------
@@ -1488,6 +1582,7 @@ async function showConductorPortal() {
       <h2><span class="icon">🎫</span> Conductor</h2>
       <div class="menu-grid">
         <div class="menu-btn" onclick="showPickTrip()"><span class="menu-icon">🚌</span>Select My Trip</div>
+        <div class="menu-btn" onclick="showTripStatus()"><span class="menu-icon">🚦</span>Trip Status</div>
         <div class="menu-btn" onclick="showWalkIn()"><span class="menu-icon">🚶</span>Record Walk-In</div>
         <div class="menu-btn" onclick="showTripLog()"><span class="menu-icon">📋</span>Trip Manifest</div>
       </div>
@@ -1550,9 +1645,140 @@ function pickTrip(busNumber, departureTime, label) {
   conductorTrip = {
     bus_number: busNumber,
     departure_iso: dep ? dep.toISOString() : null,
+    hhmm: departureTime,
     label: departureTime + (label ? ' · ' + label : ''),
   };
   showConductorPortal();
+}
+
+// ---------- TRIP STATUS (Phase 3 steps 1-2) ----------
+// The conductor drives the trip lifecycle: start -> boarding -> departed ->
+// en-route -> arrive. The trip row is created lazily on the first Start.
+const TRIP_NEXT = {
+  SCHEDULED: { state: 'BOARDING', label: '👥 Start Boarding' },
+  BOARDING:  { state: 'DEPARTED', label: '🚌 Depart' },
+  DEPARTED:  { state: 'EN_ROUTE', label: '🛣️ Begin En-Route' },
+  EN_ROUTE:  { state: 'COMPLETED', label: '🏁 Arrive — Complete Trip' },
+};
+const TRIP_HINTS = {
+  SCHEDULED: 'Trip created. Open boarding when students start gathering.',
+  BOARDING: 'Students are boarding. Depart when everyone is on.',
+  DEPARTED: 'Left the pickup point. Mark en-route once on the main road.',
+  EN_ROUTE: 'On the way. Mark arrival when you reach the drop-off.',
+  COMPLETED: 'Trip complete. Seats have been released for the next run.',
+  CANCELLED: 'Trip cancelled.',
+};
+
+// ---------- CONDUCTOR GPS SHARE (Phase 3 step 3) ----------
+// Opt-in per trip: browser watchPosition -> throttled POST every 15 s.
+// Pauses when the tab is hidden; stops on trip completion or toggle-off.
+const GPS_SHARE = { watchId: null, timer: null, lastSent: 0 };
+
+function gpsShareOn() { return GPS_SHARE.watchId !== null; }
+
+function toggleGpsShare() {
+  if (gpsShareOn()) return stopGpsShare();
+  if (!navigator.geolocation) return showAlert('alert', 'This device does not support location sharing.', 'error');
+  GPS_SHARE.watchId = navigator.geolocation.watchPosition(
+    () => {},                              // fixes are pulled on the send timer
+    () => { stopGpsShare(); showAlert('gps', 'Location permission denied — trip runs untracked.', 'error'); },
+    { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 });
+  GPS_SHARE.timer = setInterval(sendGpsFix, 15000);
+  showAlert('gps', '📡 Location sharing is ON for this trip.', 'success');
+  const btn = document.getElementById('gps_btn');
+  if (btn) btn.textContent = '📡 Sharing location — tap to stop';
+}
+
+function stopGpsShare() {
+  if (GPS_SHARE.watchId !== null) { navigator.geolocation.clearWatch(GPS_SHARE.watchId); GPS_SHARE.watchId = null; }
+  if (GPS_SHARE.timer) { clearInterval(GPS_SHARE.timer); GPS_SHARE.timer = null; }
+  const btn = document.getElementById('gps_btn');
+  if (btn) btn.textContent = '📡 Share live location';
+}
+
+async function sendGpsFix() {
+  if (!gpsShareOn() || !conductorTrip || !conductorTrip.trip_id) return;
+  if (document.hidden) return;                       // honest battery trade-off
+  navigator.geolocation.getCurrentPosition(async pos => {
+    const { latitude, longitude, accuracy, speed } = pos.coords;
+    try {
+      await apiCall('POST', `/api/trips/${conductorTrip.trip_id}/position`,
+        { lat: latitude, lng: longitude, accuracy_m: accuracy, speed_mps: speed }, true);
+    } catch { /* next tick retries; server dedupes bursts */ }
+  }, () => {}, { enableHighAccuracy: true, maximumAge: 10000, timeout: 15000 });
+}
+
+function tripChip(state) {
+  return `<span style="background:#e8eefc;color:#1c3d8f;padding:2px 10px;border-radius:10px;font-size:12px;font-weight:600">${state}</span>`;
+}
+
+async function showTripStatus() {
+  const t = requireTrip(); if (!t) return;
+  render(backLink('showConductorPortal') + `<div class="card"><h2><span class="icon">🚦</span>Trip Status</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let trip;
+  try {
+    trip = await apiCall('GET', `/api/trips/current?bus_number=${t.bus_number}&departure_time=${encodeURIComponent(t.departure_iso)}`, undefined, true);
+  } catch (e) {
+    return render(backLink('showConductorPortal') + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
+  if (trip.exists) conductorTrip.trip_id = trip.trip_id;
+  let html = backLink('showConductorPortal') + `
+    <div class="card">
+      <h2><span class="icon">🚦</span>Trip Status</h2>
+      <p class="text-muted" style="margin:4px 0 8px">${'🚌 #' + t.bus_number} — ${t.label}</p>
+      <div id="alert"></div>`;
+  if (!trip.exists) {
+    html += `
+      <p>This run has not been started yet. Starting it creates the tracked trip.</p>
+      <button class="btn btn-primary" onclick="doTripStart()">🚦 Start Trip (Boarding)</button>`;
+  } else {
+    html += `
+      <div class="list-item"><div class="row"><span class="value">State</span>${tripChip(trip.state)}</div></div>
+      <p class="text-muted" style="margin:4px 0 8px">${TRIP_HINTS[trip.state] || ''}</p>`;
+    if (trip.actual_departure) html += `<div class="list-item"><div class="row"><span class="label">Departed at</span><span class="label">${new Date(trip.actual_departure).toLocaleTimeString()}</span></div></div>`;
+    if (trip.actual_arrival) html += `<div class="list-item"><div class="row"><span class="label">Arrived at</span><span class="label">${new Date(trip.actual_arrival).toLocaleTimeString()}</span></div></div>`;
+    const next = TRIP_NEXT[trip.state];
+    if (next) {
+      html += `<button class="btn btn-success" onclick="doTripState('${next.state}')">${next.label}</button>`;
+      html += `<div id="gps" style="margin-top:8px"></div>`;
+      html += `<button class="btn btn-outline btn-sm" id="gps_btn" style="width:100%;margin-top:8px" onclick="toggleGpsShare()">${gpsShareOn() ? '📡 Sharing location — tap to stop' : '📡 Share live location'}</button>`;
+      html += `<hr class="divider"><button class="btn btn-danger btn-sm" onclick="doTripState('CANCELLED')">🚫 Cancel Trip</button>`;
+    } else {
+      stopGpsShare();
+      html += `<p class="text-muted">No further actions for this trip.</p>`;
+    }
+  }
+  html += '</div>';
+  render(html);
+}
+
+async function doTripStart() {
+  const t = conductorTrip; if (!t || !t.hhmm) return showPickTrip();
+  try {
+    const r = await apiCall('POST', '/api/trips/start',
+      { bus_number: t.bus_number, departure_time: t.hhmm }, true);
+    conductorTrip.trip_id = r.trip_id;
+    showTripStatus();
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
+  }
+}
+
+async function doTripState(state) {
+  const t = conductorTrip; if (!t) return showPickTrip();
+  try {
+    let tripId = t.trip_id;
+    if (!tripId) {
+      const trip = await apiCall('GET', `/api/trips/current?bus_number=${t.bus_number}&departure_time=${encodeURIComponent(t.departure_iso)}`, undefined, true);
+      if (!trip.exists) return showTripStatus();
+      tripId = trip.trip_id;
+      conductorTrip.trip_id = tripId;
+    }
+    await apiCall('POST', `/api/trips/${tripId}/state`, { state }, true);
+    showTripStatus();
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
+  }
 }
 
 function showWalkIn() {

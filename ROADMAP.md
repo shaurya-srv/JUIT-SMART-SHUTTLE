@@ -44,8 +44,8 @@
 | FR-14 | Scheduler monitors route capacity | ✅ | `GET /api/reports/capacity` (per-route assigned/capacity/available) |
 | FR-15 | Admin manages staff passwords in-app | ✅ | `GET /api/admin/staff`, `POST /api/admin/staff-password` (min 8 chars, hashed) |
 | — | **Beyond PRD:** admin-managed student accounts | ✅ | Public reset removed; bulk import (`POST /api/admin/students`), shared default password, forced first-login change (`must_change_password`, enforced in middleware), admin-only reset (`POST /api/admin/students/:roll/password`) |
-| FR-16 | Add approved requests to active/dispatched trips when feasible | ❌ | Phase 3 (needs `trips` entity + active-trip state) |
-| FR-17 | Reject unsafe dynamic insertion (capacity / detour / service window) | ❌ | Phase 3 — hard constraints must fail safely into the normal request flow |
+| FR-16 | Add approved requests to active/dispatched trips when feasible | ✅ v1 | `POST /api/trips/:id/join` — student attaches an APPROVED request to a boarding/rolling trip; per-departure cap + FR-07 atomic seat claim |
+| FR-17 | Reject unsafe dynamic insertion (capacity / detour / service window) | ✅ v1 | pure `validateJoin()`: not-approved / route+direction (corridor walk-distance) / window-passed / departure-full / no-live-tracking / stop-already-passed / bus-off-route — each a specific 409, never silent; unmapped coords fail SAFE |
 
 ---
 
@@ -73,7 +73,7 @@
 | 6.4 | Shared-trip grouping | ✅ v1 | Requests sharing a feasible departure naturally pool onto it (per-departure seat accounting) |
 | 6.5 | Earliest-deadline constraint | ✅ v1 | Requests processed earliest-`required_time`-first; the constrained seat always goes to the tightest deadline (tested) |
 | 6.6 | Existing-trip-first policy | ✅ v1 | Only scheduled departures are used in v1; nothing new is invented |
-| 6.7 | On-route dynamic pickup/drop addition | ❌ | Phase 3 — insertion engine with hard constraints (FR-17) |
+| 6.7 | On-route dynamic pickup/drop addition | ✅ v1 | join-running-bus: corridor-membership route rule (coordinate-driven via `route_stops`, walking-distance tolerance, direction-aware); capacity/window/position hard constraints all specific-rejection |
 | 6.8 | Vehicle selection (van 3–6, bus >6) | ✅ v1 | `seatRank()`: right-sized van < bus < undersized at equal departure; scheduler picks windows per run |
 | 6.9 | Maximum acceptable delay | ✅ v1 | `max_delay_minutes` (default 30) + `max_earliness_minutes` (default 60) enforced in the planner; scheduler-prompted each run |
 | 6.10 | Trip cost/score comparison | 🟡 | Implicit (earliest-first keeps later runs free); formal cost scoring deferred to Phase 4 |
@@ -91,7 +91,7 @@
 | 7.4 | Student check-in / boarding confirmation | ❌ | Phase 2 — checked-in vs reserved distinction |
 | 7.5 | Real-time occupancy & seat state | 🟡 | Seats update on booking/completion; no checked-in state, no walk-ins yet |
 | 7.6 | ETA information | ❌ | Phase 4 — fixed per-segment estimates first; GPS ETA later |
-| 7.7 | Route-insertion decision engine | ❌ | Phase 3 (formalized 6.7) |
+| 7.7 | Route-insertion decision engine | ✅ v1 | `validateJoin()` — ordered hard constraints with named codes; geometries in pure `lib/geo.js` (39+ checks) |
 | 7.8 | Priority / emergency requests | ❌ | Staff-only flag; relaxes cost rules, never capacity/safety |
 | 7.9 | Trip efficiency dashboard | ❌ | Phase 4 — trips run, occupancy, trips avoided, est. savings |
 | 7.10 | Explainable dispatch decisions | ✅ v1 | Dispatch report renders a per-request decision log (vehicle, departure, reason) + per-departure fill counts |
@@ -100,7 +100,7 @@
 | 7.13 | Vehicle operational state | ✅ v1 | Column + CHECK + auto-assign guard + `PATCH .../state` + UI; dispatch now auto-sets `DISPATCHED` on used vehicles (`ON_TRIP` arrives with Phase 3 GPS) |
 | 7.14 | Maintenance tracking | 🟡 | `last_service`/`next_service` columns exist; no UI, no auto-exclusion by date |
 | 7.15–7.17 | Walk-ins & manual seat adjustments | ❌ | Phase 2 (see WR table) |
-| 7.18–7.26 | Live tracking, conductor GPS mode, join-running-bus | ❌ | Phase 3 — riskiest area: stale-location handling, privacy (§7.25), guardrails (§7.23) |
+| 7.18–7.26 | Live tracking, conductor GPS mode, join-running-bus | ✅ v1 | conductor 📡 share (15 s throttle, hidden-tab pause), public live board with 90 s staleness ("last seen X min ago", never extrapolated), join-running-bus (see FR-16/17); positions INSERT-only as Phase 4 ETA history |
 
 ---
 
@@ -144,13 +144,17 @@ Remaining from the original Phase 1 list: none blocking; trip-merging economics 
 5. **Run Dispatch** — approve a handful of test requests, scheduler runs Dispatch with default windows; check the report reads sensibly and My Requests shows "Your ride: Bus #X — the 7:45 AM run".
 6. **Check Login Security** — intentionally fat-finger a password 8 times; confirm the account blocks, the admin monitor shows it, unblock works.
 
-### Phase 2 — Conductor mode & occupancy truth (§4.5, §7.3–7.5, §7.15–7.17, WR-01–07) — ✅ CODE DONE (2026-09-15)
+### Phase 2 — Conductor mode & occupancy truth (§4.5, §7.3–7.5, §7.15–7.17, WR-01–07) — ✅ CODE DONE (2026-09-15) · latent occupancy 500 fixed 2026-09-15 (see Phase 3 note)
 Shipped: `conductor` staff role (migration 008 seeds it with the bootstrap password — **admin must change it**); `occupancy_events` audit table; `POST /api/occupancy` (guard/conductor/admin) with WR-01 (dispatched vehicles only), WR-02 (FR-07 guard both directions + per-departure cap), WR-05 (every event logged with actor), WR-06 (walk-ins visible in the trip log), WR-07 (validator errors, never silent); no-shows release the seat and reject the booking (7.3); `GET /api/occupancy/trip/:bus` manifest; full Conductor portal (pick trip → walk-in → manifest → no-show from manifest). 18-check validator suite. **Needs migration 008 on the production DB before use.**
 Remaining for full §7.5: checked-in vs reserved distinction in student-facing seat counts (minor).
 
-### Phase 3 — Live tracking & dynamic insertion (§7.18–7.26, FR-16/17, 6.7/7.7)
-- Introduce the **`trips` entity** (dispatchable trip instances with stop sequences) — the one true architectural addition left; Phase 1 deliberately avoids it by using scheduled departures.
-- Conductor GPS sharing (browser geolocation), trip states `SCHEDULED → BOARDING → DEPARTED → EN_ROUTE → COMPLETED`, student-facing live bus view, guarded join/insertion with safe fallback to the normal request flow.
+### Phase 3 — Live tracking & dynamic insertion (§7.18–7.26, FR-16/17, 6.7/7.7) — ✅ CODE DONE (2026-09-15)
+- Full design in **[TRIPS_GPS_DESIGN.md](TRIPS_GPS_DESIGN.md)**; all six build steps shipped.
+- **Steps 1–2:** migration 009 (`trips` keyed on the existing `(bus_number, departure_time)` identity + `trip_positions` + `route_stops` coordinates); pure `canTransition()` lifecycle (`SCHEDULED→BOARDING→DEPARTED→EN_ROUTE→COMPLETED`/`CANCELLED`) with auto `ON_TRIP`/`AVAILABLE` flips and same-path completion of remaining bookings; routes start/state/current; conductor **Trip Status** screen. Bonus fix: `parseCampusLocal` was never imported in `server.js` — every real Phase-2 occupancy POST would have 500'd.
+- **Steps 3–4:** `POST /api/trips/:id/position` (5 s server dedupe, plausibility check, 7-day prune); public **Live Buses** board (30 s auto-refresh, 90 s staleness — "last seen X min ago", never extrapolated; degrade-to-empty ONLY on missing table, real outages surface as errors); conductor 📡 share toggle (15 s client throttle, hidden-tab pause, stops on completion/cancel); **join-running-bus** — pure `validateJoin()` (corridor-membership route+direction via `route_stops` coordinates with 500 m walk tolerance; window ≤30 min past; per-departure cap; stop-passed via fresh-fix projection) + transactional `coreJoinTrip()` with the FR-07 atomic seat claim; join UI on the live board.
+- **Verified:** 43 pure checks (`joinflow.test.js`) + 11 gate checks (`join.gates.test.js`) on top of steps 1–2's 29+14. Stop-order design question RESOLVED (coordinate-driven, fail-safe).
+- **Needs on the production DB:** the updated `apply_all_pending.sql` (sanity grid now 14 columns, ending `trips_table 1 · trip_positions_table 1 · route_stops_seeded 4`). **Also ground-truth the approximate `route_stops` coordinates** in migration 009 against a real map and UPDATE them — every join decision derives from them.
+- Remaining polish (Phase 4 territory): ETAs from position history, dead-trip detection, maps rendering.
 
 ### Phase 4 — Intelligence & efficiency (§7.1, 7.2, 7.6, 7.8, 7.9, 7.11, 7.12)
 - Demand history + simple prediction, trip merging, fixed-segment ETAs, priority flag, efficiency dashboard, anti-starvation threshold, dead-trip detection.

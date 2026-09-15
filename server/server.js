@@ -12,7 +12,9 @@ const {
   coreApproveRequest, coreRejectRequest, coreCompleteRequest,
   coreDispatchApprovedRequests,
   coreRecordOccupancyEvent, coreTripLog,
-  parseRequiredTime, BOOKING_CUTOFF_MINUTES,
+  parseRequiredTime, parseCampusLocal, BOOKING_CUTOFF_MINUTES,
+  coreStartTrip, coreSetTripState, coreGetTrip, TRIP_STATES,
+  coreIngestPosition, coreActiveTrips, coreJoinTrip, isMissingTableError,
 } = require('./lib/service');
 const { LOCATIONS, MAX_BUS_CAPACITY } = require('./lib/models');
 
@@ -835,6 +837,138 @@ app.get('/api/occupancy/trip/:bus_number', authenticate,
     res.json({ bus_number: bn, departure_time: dep.toISOString(), ...log });
   } catch {
     res.status(500).json({ error: 'database error reading trip log' });
+  }
+}));
+
+// ============================================================
+// Trip lifecycle (Phase 3 steps 1-2 — TRIPS_GPS_DESIGN.md)
+// Trip rows are created lazily here and keyed by the same
+// (bus_number, departure_time) identity occupancy_events already uses, so
+// every pre-existing flow keeps working when no trip row exists (old DBs,
+// untracked runs).
+// ============================================================
+
+const TRIP_ACTORS = ['guard', 'conductor', 'admin'];
+
+app.post('/api/trips/start', authenticate, requireRole(...TRIP_ACTORS), ah(async (req, res) => {
+  const { bus_number, departure_time } = req.body || {};
+  if (!bus_number || !departure_time) {
+    return res.status(400).json({ error: 'bus_number and departure_time (HH:MM) are required' });
+  }
+  try {
+    const actor = req.session.role === 'conductor'
+      ? ('conductor-' + (req.session.name || '')) : req.session.role;
+    const result = await coreStartTrip(
+      { bus_number, departure_time }, actor, new Date());
+    if (!result.ok) {
+      const status = /not found/.test(result.error) ? 404 : 409;
+      return res.status(status).json({ error: result.error });
+    }
+    res.status(201).json(result);
+  } catch {
+    res.status(500).json({ error: 'database error starting trip' });
+  }
+}));
+
+app.post('/api/trips/:id/state', authenticate, requireRole(...TRIP_ACTORS), ah(async (req, res) => {
+  const tripId = parseInt(req.params.id, 10);
+  const state = String((req.body || {}).state || '').toUpperCase();
+  if (!tripId) return res.status(400).json({ error: 'trip id must be numeric' });
+  if (!TRIP_STATES.includes(state)) {
+    return res.status(400).json({ error: 'state must be one of ' + TRIP_STATES.join(', ') });
+  }
+  try {
+    const actor = req.session.role;
+    const result = await coreSetTripState(tripId, state, actor, new Date());
+    if (!result.ok) {
+      const status = /not found/.test(result.error) ? 404 : 409;
+      return res.status(status).json({ error: result.error });
+    }
+    res.json(result);
+  } catch {
+    res.status(500).json({ error: 'database error updating trip' });
+  }
+}));
+
+app.get('/api/trips/current', authenticate, requireRole(...TRIP_ACTORS, 'scheduler'), ah(async (req, res) => {
+  const bn = parseInt(req.query.bus_number, 10);
+  const dep = req.query.departure_time
+    ? (parseCampusLocal(req.query.departure_time).ok
+      ? parseCampusLocal(req.query.departure_time).date
+      : new Date(req.query.departure_time))
+    : null;
+  if (!bn || !dep || isNaN(dep.getTime())) {
+    return res.status(400).json({ error: 'bus_number and a full departure_time timestamp (ISO or YYYY-MM-DDTHH:mm) are required' });
+  }
+  try {
+    const trip = await coreGetTrip(bn, dep.toISOString());
+    res.json(trip);
+  } catch {
+    res.status(500).json({ error: 'database error reading trip' });
+  }
+}));
+
+// GPS ingest (§7.23): only trip actors may post; 5 s server-side dedupe;
+// implausible coordinates rejected before history is polluted.
+app.post('/api/trips/:id/position', authenticate, requireRole(...TRIP_ACTORS), ah(async (req, res) => {
+  const tripId = parseInt(req.params.id, 10);
+  const { lat, lng, accuracy_m, speed_mps } = req.body || {};
+  if (!tripId) return res.status(400).json({ error: 'trip id must be numeric' });
+  const fix = {
+    lat: Number(lat), lng: Number(lng),
+    accuracy_m: accuracy_m !== undefined ? Number(accuracy_m) : undefined,
+    speed_mps: speed_mps !== undefined ? Number(speed_mps) : undefined,
+  };
+  try {
+    const r = await coreIngestPosition(tripId, fix);
+    if (!r.ok) {
+      if (r.dedupe) return res.status(429).json({ error: r.error });
+      const status = /not found/.test(r.error) ? 404 : 409;
+      return res.status(status).json({ error: r.error });
+    }
+    res.status(201).json(r);
+  } catch {
+    res.status(500).json({ error: 'database error storing position' });
+  }
+}));
+
+// Public live board (§7.18): active trips + latest fix + age. Same privacy
+// posture as /api/timetable/public — active trips only, never history, never
+// student data. Degrades to an empty board when the trips table is missing
+// (production DB not yet migrated) so students just see "no buses running".
+app.get('/api/trips/active', ah(async (req, res) => {
+  try {
+    res.json(await coreActiveTrips());
+  } catch (e) {
+    // Un-migrated DB (no trips table yet): an empty board is the truthful,
+    // graceful answer — students just see "no buses running". A genuine
+    // outage (DB unreachable) must surface as an error, never fake-empty.
+    if (isMissingTableError(e)) {
+      return res.json({ count: 0, trips: [], degraded: true });
+    }
+    res.status(500).json({ error: 'database error reading live trips' });
+  }
+}));
+
+// Join-running-bus (FR-16/17): a student attaches their OWN approved request
+// to an active trip. Every rejection is 409 with the specific reason; success
+// claims the seat through the FR-07 guarded UPDATE.
+app.post('/api/trips/:id/join', authenticate, requireRole('student'), ah(async (req, res) => {
+  const tripId = parseInt(req.params.id, 10);
+  const requestNumber = parseInt((req.body || {}).request_number, 10);
+  if (!tripId) return res.status(400).json({ error: 'trip id must be numeric' });
+  if (!requestNumber) return res.status(400).json({ error: 'request_number is required' });
+  try {
+    const r = await coreJoinTrip(tripId, requestNumber, req.session.roll_number);
+    if (!r.ok) {
+      if (r.code === 'request_not_found' || r.code === 'trip_not_found') {
+        return res.status(404).json({ error: r.message || r.code });
+      }
+      return res.status(409).json({ error: r.message || r.code, code: r.code });
+    }
+    res.status(201).json(r);
+  } catch {
+    res.status(500).json({ error: 'database error joining trip' });
   }
 }));
 

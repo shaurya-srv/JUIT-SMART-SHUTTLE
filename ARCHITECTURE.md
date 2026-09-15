@@ -141,8 +141,12 @@ legacy/                    archived C CLI + winsock2 HTTP server + MySQL code
 | `credentials` | one row per staff role (`guard`, `scheduler`, `admin`), PBKDF2 password |
 | `pickup_requests` | request number, student FK, named places, location indexes, direction, status, `required_time` (PRD 6.1), `completed_at` |
 | `buses` | bus number, route pickup/dropoff (location indexes), `current_count`, `max_capacity`, `vehicle_type` (bus/van), `state` (AVAILABLE/DISPATCHED/ON_TRIP/MAINTENANCE/OFFLINE), `last_service`/`next_service` |
-| `bus_assignments` | request → bus mapping (one per request), keeps history after completion |
+| `bus_assignments` | request → bus mapping (one per request), keeps history after completion; `departure_time` (migration 006) scopes the booking to a specific run |
 | `bus_schedules` | per-bus departure times (`TIME`), optional label, FK to buses |
+| `trips` | (Phase 3) lazy lifecycle rows keyed by the same `(bus_number, departure_time)` identity — `UNIQUE`; states `SCHEDULED→BOARDING→DEPARTED→EN_ROUTE→COMPLETED`/`CANCELLED`, actual departure/arrival stamps |
+| `trip_positions` | (Phase 3) INSERT-only GPS fixes per trip — route history for Phase 4 ETAs |
+| `occupancy_events` | (Phase 2) audited walk-ins/no-shows/check-ins keyed by `(bus_number, departure_time)` |
+| `login_failures` | (Phase 2) DB-backed brute-force counters (serverless-safe, global) |
 
 Status values: `PENDING_APPROVAL`, `APPROVED`, `REJECTED`, `COMPLETED`.
 
@@ -202,17 +206,58 @@ password), records on-vehicle reality against a **dispatched** departure:
 - Pure validator (`validateOccupancyEvent`) is unit-tested in
   `server/tests/occupancy.test.js` (18 checks).
 
-## 8. Known gaps / backlog
+## 8. Trip lifecycle, GPS & join-running-bus (Phase 3)
+`trips` rows are created **lazily** when a conductor/guard/admin starts a run —
+a departure nobody tracks never gets a row, and every Phase 1/2 flow works
+with zero trips rows (same fail-soft rule as the 004/006 hardening). The row
+adopts the identity occupancy_events and assignments already use:
+`(bus_number, departure_time)` with a UNIQUE constraint (migration 009).
+- `POST /api/trips/start` (conductor/guard/admin) — create-or-attach today's
+  run; idempotent via ON CONFLICT (re-starting returns the same row).
+- `POST /api/trips/:id/state` (conductor/guard/admin) — validated by the pure
+  `canTransition()` state machine; `DEPARTED` flips the bus `ON_TRIP` (PRD
+  7.13's auto half); `COMPLETED`/`CANCELLED` set it back to `AVAILABLE`, reset
+  occupancy, and `COMPLETED` also completes remaining APPROVED bookings on
+  that departure.
+- `GET /api/trips/current` — read a run's lifecycle state (also schedulers).
+- Conductor portal: **Trip Status** screen drives Start → Boarding → Depart →
+  En-Route → Arrive with a Cancel fallback, plus the 📡 **Share live location**
+  toggle (browser geolocation, 15 s client throttle, pauses on hidden tab,
+  stops on completion/cancel).
+- `POST /api/trips/:id/position` (conductor/guard/admin) — GPS ingest:
+  plausibility check, 5 s server-side dedupe backstop, 7-day opportunistic
+  prune (positions double as Phase 4 ETA history).
+- `GET /api/trips/active` (public) — the live board: active trips + latest
+  fix + age. 90 s staleness: students see "last seen X min ago", never an
+  extrapolated position. Degrades to an empty board **only** when the trips
+  table is missing (un-migrated DB); a genuine DB outage surfaces as an error
+  (never a fake "no buses running") — `isMissingTableError()` draws that line.
+- `POST /api/trips/:id/join` (student, own request) — join-running-bus
+  (FR-16/17): pure `validateJoin()` checks status → route+direction
+  (corridor membership via `route_stops` coordinates, 500 m walk tolerance,
+  never index-assumed) → service window (≤30 min past) → per-departure
+  capacity → (moving bus) fresh fix, on-corridor, stop not passed — every
+  rejection a specific 409 code; the seat moves through the FR-07 guarded
+  UPDATE in the same transaction as the assignment insert. Unmapped
+  coordinates fail SAFE.
+- Geometry lives in `server/lib/geo.js` (pure): haversine, corridor
+  projection, stop-passed, staleness, dedupe, plausibility.
+- Design: `TRIPS_GPS_DESIGN.md`. **The seeded `route_stops` coordinates are
+  approximate — ground-truth them and UPDATE; every join decision derives
+  from them.**
+
+## 9. Known gaps / backlog
 - ~~`POST /api/reset-password` is unauthenticated~~ — **removed.** Student
   passwords are admin-managed: bulk import with a default password, forced
   one-time change at first login (`students.must_change_password`, enforced in
   login and on every student request via the `mcp` token claim), logged-in
   change via `PUT /api/students/password`, and admin-only reset via
   `POST /api/admin/students/:roll/password` (also re-forces the change).
-- No login rate limiting (brute-force protection for staff passwords).
+- ~~No login rate limiting~~ — **done**: DB-backed sliding window (8 fails/
+  15 min per account, 30/15 min per IP), 429 + Retry-After, admin monitor.
 - `SHUTTLE_DB_PASS` rotation pending (old password appeared in chat).
 
-## 9. Legacy system (archived)
+## 10. Legacy system (archived)
 The project began as a C application: CLI portals (`legacy/src/cli`),
 a business-rule core (`legacy/src/core`), a MySQL data layer, and a winsock2
 HTTP/JSON server (`legacy/src/api`) with its own test suite

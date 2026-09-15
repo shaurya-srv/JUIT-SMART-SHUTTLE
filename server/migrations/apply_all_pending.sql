@@ -9,10 +9,12 @@
 --   006  dispatch engine (departure-scoped assignments)
 --   007  login rate limiting (login_failures table)
 --   008  conductor mode (occupancy_events + conductor role)
+--   009  trips entity + GPS positions (Phase 3 tables; lifecycle uses them)
 -- Ends with a sanity-check query — expect buses_total=12, vans=6,
 -- schedules_total=24, van_departures=12, buses_vehicle_typed=12, reqs_typed=1,
 -- students_have_flags=1, assignments_have_departure_time=1,
--- login_failures_table=1, occupancy_events_table=1, conductor_role=1.
+-- login_failures_table=1, occupancy_events_table=1, conductor_role=1,
+-- trips_table=1, trip_positions_table=1.
 -- ============================================================================
 
 
@@ -256,11 +258,72 @@ CREATE INDEX IF NOT EXISTS idx_occupancy_created
 
 
 -- ============================================================================
+-- MIGRATION 009: trips entity + GPS positions (Phase 3, steps 1-2)
+--   `trips` adopts the existing (bus_number, departure_time) trip identity
+--   (UNIQUE — no changes to 006/008 tables); rows are created lazily when a
+--   conductor starts a trip, so all Phase 1/2 flows work with zero rows.
+--   trip_positions is INSERT-only route history (Phase 4 ETA fuel).
+--   Lifecycle/GPS code ships with this migration applied.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS trips (
+  trip_id          BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  bus_number       INTEGER NOT NULL REFERENCES buses(bus_number),
+  departure_time   TIMESTAMPTZ NOT NULL,
+  route_pickup     INTEGER NOT NULL,
+  route_dropoff    INTEGER NOT NULL,
+  state            VARCHAR(12) NOT NULL DEFAULT 'SCHEDULED'
+                   CHECK (state IN ('SCHEDULED','BOARDING','DEPARTED','EN_ROUTE','COMPLETED','CANCELLED')),
+  boarded_count    INTEGER NOT NULL DEFAULT 0,
+  actual_departure TIMESTAMPTZ,
+  actual_arrival   TIMESTAMPTZ,
+  created_by       VARCHAR(60),
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (bus_number, departure_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trips_state ON trips(state);
+
+CREATE TABLE IF NOT EXISTS trip_positions (
+  position_id  BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  trip_id      BIGINT NOT NULL REFERENCES trips(trip_id) ON DELETE CASCADE,
+  lat          DOUBLE PRECISION NOT NULL,
+  lng          DOUBLE PRECISION NOT NULL,
+  accuracy_m   DOUBLE PRECISION,
+  speed_mps    DOUBLE PRECISION,
+  recorded_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_trip_positions_latest
+  ON trip_positions(trip_id, recorded_at DESC);
+
+-- Route stop coordinates for the join-running-bus engine (FR-17). Stop
+-- ORDER is derived from these coordinates by corridor projection — never
+-- assumed from location indexes. NOTE: approximate values; ground-truth
+-- them on a map and UPDATE. NULL coordinate = join check fails SAFE.
+CREATE TABLE IF NOT EXISTS route_stops (
+  location_index INTEGER PRIMARY KEY,
+  name           VARCHAR(50) NOT NULL,
+  lat            DOUBLE PRECISION,
+  lng            DOUBLE PRECISION
+);
+
+INSERT INTO route_stops (location_index, name, lat, lng) VALUES
+  (0, 'JUIT',        31.0176, 77.0735),
+  (1, 'Ravli PG',    31.0128, 77.0795),
+  (2, 'Peach Tree',  31.0092, 77.0838),
+  (3, 'Waknaghat',   31.0055, 77.0885)
+ON CONFLICT (location_index) DO NOTHING;
+
+
+-- ============================================================================
 -- SANITY CHECK — the result grid after Run should show:
 --   buses_total 12 · vans 6 · schedules_total 24 · van_departures 12
 --   buses_vehicle_typed 12 · requests_have_required_time 1
 --   students_have_flags 1 · assignments_have_departure_time 1
 --   login_failures_table 1 · occupancy_events_table 1 · conductor_role 1
+--   trips_table 1 · trip_positions_table 1 · route_stops_seeded 4
 -- ============================================================================
 SELECT
   (SELECT COUNT(*) FROM buses)                                   AS buses_total,
@@ -282,4 +345,9 @@ SELECT
      WHERE table_name = 'login_failures')                       AS login_failures_table,
   (SELECT COUNT(*) FROM information_schema.tables
      WHERE table_name = 'occupancy_events')                     AS occupancy_events_table,
-  (SELECT COUNT(*) FROM credentials WHERE role = 'conductor')   AS conductor_role;
+  (SELECT COUNT(*) FROM credentials WHERE role = 'conductor')   AS conductor_role,
+  (SELECT COUNT(*) FROM information_schema.tables
+     WHERE table_name = 'trips')                                AS trips_table,
+  (SELECT COUNT(*) FROM information_schema.tables
+     WHERE table_name = 'trip_positions')                       AS trip_positions_table,
+  (SELECT COUNT(*) FROM route_stops WHERE lat IS NOT NULL)      AS route_stops_seeded;
