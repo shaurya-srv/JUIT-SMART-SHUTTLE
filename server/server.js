@@ -68,11 +68,22 @@ function requireRole(...roles) {
 // ============================================================
 
 app.get('/api/health', ah(async (req, res) => {
+  // db_host/db_user make "app is pointed at the wrong database" visible
+  // instantly (hostnames/usernames are not secrets; the password never is).
   try {
-    await db.query('SELECT 1');
-    res.json({ status: 'ok', database: 'up' });
+    const [r] = await db.query('SELECT current_user AS db_user');
+    res.json({
+      status: 'ok',
+      database: 'up',
+      db_host: process.env.SHUTTLE_DB_HOST || '(default)',
+      db_user: r[0].db_user,
+    });
   } catch {
-    res.json({ status: 'ok', database: 'down' });
+    res.json({
+      status: 'ok',
+      database: 'down',
+      db_host: process.env.SHUTTLE_DB_HOST || '(default)',
+    });
   }
 }));
 
