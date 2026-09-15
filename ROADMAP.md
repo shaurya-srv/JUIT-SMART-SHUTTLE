@@ -18,7 +18,7 @@
 | FR-03 booking cutoff | ✅ | Built on top of baseline (optional `required_time`) |
 | Dispatch optimizer (§6, FR-09–11) | ✅ v1 | Engine ships: pools by route+deadline, fills scheduled departures, van/bus sizing, decision log |
 | Dynamic active-trip insertion (FR-16–17) | ❌ | Needs the trips entity |
-| Conductor mode & walk-ins (§4.5, §7.15–7.17, WR-01–07) | ❌ | Role model ready to extend |
+| Conductor mode & walk-ins (§4.5, §7.15–7.17, WR-01–07) | ✅ v1 | Conductor role, audited walk-ins/no-shows/check-ins (occupancy_events), manifest view — needs migration 008 |
 | Live GPS tracking (§7.18–7.26) | ❌ | Highest-risk PRD area (their own backlog flags it) |
 | Non-functional requirements (§8) | ✅ | Core NFRs met; reset hardening + login rate limiting **done**; DB password rotation outstanding |
 
@@ -119,21 +119,24 @@
 | **Password reset hardening** | ✅ | Public reset **removed**; admin-managed passwords: bulk import, default password, forced first-login change (`must_change_password`), admin-only reset |
 | **Login rate limiting** | ✅ | DB-backed sliding window (global across serverless instances): 8 fails / 15 min per account, 30 / 15 min per IP; 429 + Retry-After; fail-open on limiter outage |
 | **DB password rotation** | ❌ | Old credential appeared in chat; rotate in Supabase + Vercel |
+| **Production hardening while DB in limbo** | ✅ | Timetable + request lists degrade gracefully when 004/006 columns are missing (fallback queries, label-sniffed vans) |
 
 ---
 
 ## 7. Recommended Build Order
 
 ### Phase 0 — Ship what exists (now)
-1. **Two-database split — DECIDED 2026-09-15:** the **old project** stays the production DB (Vercel's pooler user `postgres` resolves there). The new project (`afydafeurljiqlnydywh`) is retired once `apply_all_pending.sql` has been run on the old one and production verifies green. The new project's copy of the data is a scratch copy — do not repoint Vercel to it.
-2. Apply migrations **002–005** on the **old** project via `server/migrations/apply_all_pending.sql` (idempotent).
-3. Security quick wins before students arrive: ~~protect reset-password~~ (done — admin-managed), ~~login rate limiting~~ (done — `login_failures` table), rotate `SHUTTLE_DB_PASS`.
+1. **TWO-DATABASE MYSTERY — THE ACTIVE BLOCKER.** Production (Vercel, pooler user `postgres`) hits a DB that still lacks the migration columns (fresh `column b.vehicle_type does not exist` errors on 2026-09-15), yet `apply_all_pending.sql` has been "run successfully" twice — both times apparently landing on the new project (`afydafeurljiqlnydywh`), whose fresh-project grid matches the expected numbers exactly and proves nothing. **Next step:** run `select count(*) from students;` in EACH project's SQL Editor — the one with real student rows is production. Run the SQL THERE.
+2. Apply migrations **002–007** on that project via `server/migrations/apply_all_pending.sql` (idempotent; expected grid `12·6·24·12·12·1·1·1·1`). Fallback if the SQL Editor route keeps misfiring: Supabase access token + Management API over HTTPS (port 443 is reachable; 5432/6543 are firewalled on campus WiFi).
+3. Security quick wins before students arrive: ~~protect reset-password~~ (done), ~~login rate limiting~~ (done), rotate `SHUTTLE_DB_PASS`.
+4. ~~Commit & push engine + limiter~~ — shipped in `998bb8d`, deployed, and verified graceful on the un-migrated DB (limiter fails open → clean 401s; only request lists 500 until column 006 exists).
 
 ### Phase 1 — ~~Dispatch engine v1~~ ✅ DONE (2026-09-15)
 Shipped: `planDispatch()` (pure, 24-test suite in `server/tests/dispatch.test.js`) + transactional applier `coreDispatchApprovedRequests()`; scheduled departures as per-departure-capped trips; earliest-deadline-first; van/bus sizing tie-break; scheduler-configurable `max_delay_minutes`/`max_earliness_minutes` (30/60); per-request decision log in the UI; FR-07 guarded writes; `DISPATCHED` auto-transition; `bus_assignments.departure_time` (migration 006 — run it in Supabase). Also fixed: datetime-local inputs are now interpreted as IST campus time, not server-UTC.
 Remaining from the original Phase 1 list: none blocking; trip-merging economics (7.2) and cost scoring (6.10) are Phase 4.
 
 ### Phase 0.5 — Go-live dry run (checklist for the day before students arrive)
+**Code ✅ shipped in `998bb8d`** ("Your ride" card, vehicle_type in lists, Login Security monitor); the dry run itself executes once the SQL lands on the right DB:
 1. **Import a real batch** — Admin → Students & Passwords → paste roll numbers + names → set the default password → Import. Confirm the report says how many imported vs skipped.
 2. **Hand out the default in person** (notice board / WhatsApp screenshot in person — never a broadcast group). Do NOT send it in a way a stranger could see.
 3. **Watch one forced change** — a student logs in with the default → the "Set your password" screen appears → they change it → portal opens. Verify the badge flips to "active" in the admin student list.
@@ -141,9 +144,9 @@ Remaining from the original Phase 1 list: none blocking; trip-merging economics 
 5. **Run Dispatch** — approve a handful of test requests, scheduler runs Dispatch with default windows; check the report reads sensibly and My Requests shows "Your ride: Bus #X — the 7:45 AM run".
 6. **Check Login Security** — intentionally fat-finger a password 8 times; confirm the account blocks, the admin monitor shows it, unblock works.
 
-### Phase 2 — Conductor mode & occupancy truth (§4.5, §7.3–7.5, §7.15–7.17, WR-01–07)
-- `conductor` role; walk-in recording, no-show marking, boarding check-in; `occupancy_events` audit table.
-- All seat mutations flow through the FR-07 capacity guard; live occupancy distinguishes reserved / checked-in / walk-in.
+### Phase 2 — Conductor mode & occupancy truth (§4.5, §7.3–7.5, §7.15–7.17, WR-01–07) — ✅ CODE DONE (2026-09-15)
+Shipped: `conductor` staff role (migration 008 seeds it with the bootstrap password — **admin must change it**); `occupancy_events` audit table; `POST /api/occupancy` (guard/conductor/admin) with WR-01 (dispatched vehicles only), WR-02 (FR-07 guard both directions + per-departure cap), WR-05 (every event logged with actor), WR-06 (walk-ins visible in the trip log), WR-07 (validator errors, never silent); no-shows release the seat and reject the booking (7.3); `GET /api/occupancy/trip/:bus` manifest; full Conductor portal (pick trip → walk-in → manifest → no-show from manifest). 18-check validator suite. **Needs migration 008 on the production DB before use.**
+Remaining for full §7.5: checked-in vs reserved distinction in student-facing seat counts (minor).
 
 ### Phase 3 — Live tracking & dynamic insertion (§7.18–7.26, FR-16/17, 6.7/7.7)
 - Introduce the **`trips` entity** (dispatchable trip instances with stop sequences) — the one true architectural addition left; Phase 1 deliberately avoids it by using scheduled departures.
@@ -168,4 +171,4 @@ Remaining from the original Phase 1 list: none blocking; trip-merging economics 
 - Phase 0.5 shipped: student "Your ride" card, admin Login Security monitor (`GET/DELETE /api/admin/login-failures`), go-live dry-run checklist (above).
 - FR-03: 10 scenarios tested (boundary, past, invalid, skew margins).
 - Timetable/live-refresh: 8 next-departure scenarios + 7 poller behaviors tested (initial paint, stale-fetch discard, failure/retry, mode toggle, timer teardown).
-- **Pending deploy:** the dispatch engine + rate limiter code and migrations 006–007 are committed locally but not yet pushed; `apply_all_pending.sql` (002–007) has not been run on the old (production) project.
+- **Deployed `998bb8d` (2026-09-15):** dispatch engine + rate limiter + Phase 0.5 are live in production; verified the limiter fails open on the un-migrated DB (401 not 500). **Still blocked:** request lists + timetable data + dispatch runs need `apply_all_pending.sql` (002–007) executed on the production DB — see the Phase 0 blocker.

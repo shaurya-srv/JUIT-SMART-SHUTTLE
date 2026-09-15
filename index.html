@@ -415,6 +415,7 @@ function showLogin() {
         <option value="guard">Guard</option>
         <option value="scheduler">Bus Scheduler</option>
         <option value="admin">Admin</option>
+        <option value="conductor">Conductor</option>
       </select>
       <div id="rollField">
         <label>Roll Number</label>
@@ -463,6 +464,7 @@ async function doLogin() {
     if (session.role === 'student') showStudentPortal();
     else if (session.role === 'guard') showGuardPortal();
     else if (session.role === 'admin') showAdminPortal();
+    else if (session.role === 'conductor') showConductorPortal();
     else showBusSchedulerPortal();
   } catch (e) {
     showAlert('alert', e.message, 'error');
@@ -1473,6 +1475,204 @@ async function unblockIdentity(key) {
   }
 }
 
+// ---------- CONDUCTOR PORTAL (Phase 2) ----------
+// On-vehicle reality: pick the dispatched trip, then record walk-ins,
+// no-shows and check-ins against it. Every action hits the audited,
+// capacity-guarded endpoint.
+let conductorTrip = null; // { bus_number, departure_iso, label, route }
+
+async function showConductorPortal() {
+  render(`
+    <div class="welcome-bar"><span>🎫 <strong>Conductor Portal</strong></span></div>
+    <div class="card">
+      <h2><span class="icon">🎫</span> Conductor</h2>
+      <div class="menu-grid">
+        <div class="menu-btn" onclick="showPickTrip()"><span class="menu-icon">🚌</span>Select My Trip</div>
+        <div class="menu-btn" onclick="showWalkIn()"><span class="menu-icon">🚶</span>Record Walk-In</div>
+        <div class="menu-btn" onclick="showTripLog()"><span class="menu-icon">📋</span>Trip Manifest</div>
+      </div>
+      <hr class="divider">
+      <button class="btn btn-outline btn-sm" onclick="doLogout()" style="width:100%">🚪 Logout</button>
+    </div>
+  `);
+}
+
+function requireTrip() {
+  if (!conductorTrip) { showPickTrip(); return null; }
+  return conductorTrip;
+}
+
+// Today's dispatched departures to pick from.
+async function showPickTrip() {
+  render(backLink('showConductorPortal') + `<div class="card"><h2><span class="icon">🚌</span>Select My Trip</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let rows;
+  try {
+    rows = (await apiCall('GET', '/api/timetable', undefined, true)).schedule;
+  } catch (e) {
+    return render(backLink('showConductorPortal') + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
+  // Only vehicles currently dispatched/on-trip make sense for walk-ins.
+  let buses;
+  try {
+    buses = (await apiCall('GET', '/api/buses', undefined, true)).buses;
+  } catch { buses = []; }
+  const active = new Map(buses.filter(b => b.state === 'DISPATCHED' || b.state === 'ON_TRIP').map(b => [b.bus_number, b]));
+  const trips = rows.filter(r => active.has(r.bus_number));
+  let html = backLink('showConductorPortal') + `
+    <div class="card">
+      <h2><span class="icon">🚌</span>Select My Trip</h2>
+      <p class="text-muted" style="margin:4px 0 8px">Only dispatched vehicles appear. No dispatched trips? Ask the scheduler to run Dispatch.</p>`;
+  if (!trips.length) html += `<div class="empty-state"><div class="icon">🛑</div><p>No dispatched trips right now.</p></div>`;
+  trips.forEach(t => {
+    const b = active.get(t.bus_number);
+    html += `<div class="list-item"><div class="row">
+      <span class="value">${t.vehicle_type === 'van' ? '🚐 Van' : '🚌 Bus'} #${t.bus_number} — ${t.departure_time} · ${t.route}</span>
+      <button class="btn btn-primary btn-sm" onclick='pickTrip(${t.bus_number}, "${t.departure_time}", "${(t.label || '').replace(/'/g, '')}")'>Select</button>
+    </div><div class="label">${b.assigned}/${b.capacity} seats booked</div></div>`;
+  });
+  html += '</div>';
+  render(html);
+}
+
+// Frontend twin of the server's campusTimeToDate: today's IST wall-clock
+// HH:MM -> real UTC instant (the bus leaves "today" in campus time).
+function istTodayDeparture(hhmm) {
+  const m = /^(\d{1,2}):(\d{2})/.exec(String(hhmm).trim());
+  if (!m) return null;
+  const nowUtcMinutes = Date.now() + 330 * 60000;
+  const d = new Date(nowUtcMinutes);
+  const epoch = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), +m[1], +m[2]) - 330 * 60000;
+  return new Date(epoch);
+}
+
+function pickTrip(busNumber, departureTime, label) {
+  const dep = istTodayDeparture(departureTime);
+  conductorTrip = {
+    bus_number: busNumber,
+    departure_iso: dep ? dep.toISOString() : null,
+    label: departureTime + (label ? ' · ' + label : ''),
+  };
+  showConductorPortal();
+}
+
+function showWalkIn() {
+  const t = requireTrip(); if (!t) return;
+  render(backLink('showConductorPortal') + `
+    <div class="card">
+      <h2><span class="icon">🚶</span>Record Walk-In</h2>
+      <p class="text-muted" style="margin:4px 0 8px">Trip: ${'🚌 #' + t.bus_number} — ${t.label}</p>
+      <div id="alert"></div>
+      <label>Student name (or roll number)</label>
+      <input type="text" id="wi_label" placeholder="e.g. Aarav Sharma or 261030195">
+      <label>Remark (optional)</label>
+      <input type="text" id="wi_remark" placeholder="e.g. paid cash, hostel gate">
+      <button class="btn btn-success" onclick="doOccupancy('WALK_IN')">➕ Add Walk-In (uses 1 seat)</button>
+      <hr class="divider">
+      <button class="btn btn-outline btn-sm" onclick="doOccupancy('CHECK_IN')">✅ Check-In a boarding student</button>
+    </div>
+  `);
+}
+
+function showNoShow() {
+  const t = requireTrip(); if (!t) return;
+  render(backLink('showConductorPortal') + `
+    <div class="card">
+      <h2><span class="icon">🚫</span>Mark No-Show</h2>
+      <p class="text-muted" style="margin:4px 0 8px">Trip: ${'🚌 #' + t.bus_number} — ${t.label}. Releases the seat and rejects the booking.</p>
+      <div id="alert"></div>
+      <label>Booking request number</label>
+      <input type="number" id="ns_request" placeholder="e.g. 1042">
+      <label>Student name (optional, for the log)</label>
+      <input type="text" id="ns_label" placeholder="e.g. Aarav Sharma">
+      <button class="btn btn-danger" onclick="doNoShow()">🚫 Release Seat (No-Show)</button>
+    </div>
+  `);
+}
+
+async function doOccupancy(eventType) {
+  const t = conductorTrip; if (!t) return showPickTrip();
+  const label = (document.getElementById('wi_label') || {}).value || '';
+  const body = {
+    bus_number: t.bus_number,
+    departure_time: t.departure_iso,
+    event_type: eventType,
+    student_label: label || undefined,
+  };
+  const remarkEl = document.getElementById('wi_remark');
+  if (remarkEl && remarkEl.value) body.remark = remarkEl.value;
+  if (eventType !== 'WALK_IN' && !label) return showAlert('alert', 'Enter the student name or roll number.', 'error');
+  try {
+    const r = await apiCall('POST', '/api/occupancy', body, true);
+    showAlert('alert', `✅ Recorded. Seat ${r.seat_delta > 0 ? '+' : ''}${r.seat_delta} → occupancy ${r.occupancy}.`, 'success');
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
+  }
+}
+
+async function doNoShow() {
+  const t = conductorTrip; if (!t) return showPickTrip();
+  const req = parseInt((document.getElementById('ns_request') || {}).value);
+  if (!req) return showAlert('alert', 'Enter the booking request number.', 'error');
+  try {
+    const r = await apiCall('POST', '/api/occupancy', {
+      bus_number: t.bus_number,
+      departure_time: t.departure_iso,
+      event_type: 'NO_SHOW',
+      request_number: req,
+      student_label: (document.getElementById('ns_label') || {}).value || undefined,
+    }, true);
+    showAlert('alert', `✅ No-show recorded — seat released (occupancy now ${r.occupancy}).`, 'success');
+  } catch (e) {
+    showAlert('alert', e.message, 'error');
+  }
+}
+
+async function showTripLog() {
+  const t = requireTrip(); if (!t) return;
+  render(backLink('showConductorPortal') + `<div class="card"><h2><span class="icon">📋</span>Trip Manifest</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let log;
+  try {
+    log = await apiCall('GET', `/api/occupancy/trip/${t.bus_number}?departure_time=${encodeURIComponent(t.departure_iso)}`, undefined, true);
+  } catch (e) {
+    return render(backLink('showConductorPortal') + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
+  let html = backLink('showConductorPortal') + `
+    <div class="card">
+      <h2><span class="icon">📋</span>Trip Manifest</h2>
+      <p class="text-muted" style="margin:4px 0 0">${'🚌 #' + t.bus_number} — ${t.label} · ${log.manifest_count} booked</p>
+    </div>
+    <div class="card">
+      <h2><span class="icon">🎓</span>Booked Students</h2>`;
+  if (!log.manifest.length) html += `<div class="empty-state"><div class="icon">📭</div><p>No bookings on this departure.</p></div>`;
+  log.manifest.forEach(m => {
+    html += `<div class="list-item"><div class="row">
+      <span class="value">${m.student_name} (${m.roll_number})</span>
+      ${badge(m.status)}
+    </div><div class="row"><span class="label">${m.pickup_place} → ${m.dropoff_place} · ☎ ${m.phone_number}</span>
+    <button class="btn btn-danger btn-sm" onclick="nsFromManifest(${m.request_number}, '${(m.student_name || '').replace(/'/g, "\\'")}')">🚫 No-Show</button></div></div>`;
+  });
+  html += `</div><div class="card"><h2><span class="icon">🧾</span>Recent Events</h2>`;
+  if (!log.events.length) html += `<div class="empty-state"><div class="icon">🗒️</div><p>No walk-ins or events yet.</p></div>`;
+  log.events.forEach(ev => {
+    html += `<div class="list-item"><div class="row">
+      <span class="value">${ev.event_type === 'WALK_IN' ? '🚶' : ev.event_type === 'NO_SHOW' ? '🚫' : '✅'} ${ev.event_type}${ev.student_label ? ' — ' + ev.student_label : ''}</span>
+      <span class="label">${ev.seat_delta > 0 ? '+' : ''}${ev.seat_delta} seat · ${new Date(ev.created_at).toLocaleTimeString()}</span>
+    </div>${ev.remark ? `<div class="label">${ev.remark} (by ${ev.created_by})</div>` : ''}</div>`;
+  });
+  html += '</div>';
+  render(html);
+}
+
+function nsFromManifest(requestNumber, name) {
+  showNoShow();
+  setTimeout(() => {
+    const el = document.getElementById('ns_request');
+    const el2 = document.getElementById('ns_label');
+    if (el) el.value = requestNumber;
+    if (el2) el2.value = name || '';
+  }, 60);
+}
+
 // ---------- LOGOUT ----------
 function doLogout() {
   clearSession();
@@ -1487,7 +1687,12 @@ if (session) {
     .catch(() => {
       // Token may still be valid for non-student roles (mine is student-only).
       apiCall('GET', '/api/requests', undefined, true)
-        .then(() => { if (session.role === 'guard') showGuardPortal(); else if (session.role === 'admin') showAdminPortal(); else showBusSchedulerPortal(); })
+        .then(() => {
+          if (session.role === 'guard') showGuardPortal();
+          else if (session.role === 'admin') showAdminPortal();
+          else if (session.role === 'conductor') showConductorPortal();
+          else showBusSchedulerPortal();
+        })
         .catch(() => {
           if (session.role === 'student' && session.must_change) return showForceChangePassword();
           clearSession(); showLogin();

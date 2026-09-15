@@ -376,11 +376,147 @@ async function coreAssignApprovedRequests() {
   };
 }
 
+// ============================================================
+// Conductor mode (PRD §4.5, §7.3–7.5, §7.15–7.17, WR-01–07)
+// On-vehicle reality: walk-ins, no-shows, check-ins against a DISPATCHED
+// departure. Every mutation flows through the FR-07 capacity guard and
+// lands in occupancy_events (WR-05) — no silent seat changes.
+// ============================================================
+
+const WALKABLE_VEHICLE_STATES = ['DISPATCHED', 'ON_TRIP'];
+
+// PURE (WR-01/02/07): validate a walk-in/check-in/no-show before touching DB.
+//   vehicle:  { state, route_pickup, route_dropoff, current_count, max_capacity } | undefined
+//   tripLoad: seats already assigned to this exact departure
+//   input:    { bus_number, departure_time: Date, event_type, student_roll_number? }
+function validateOccupancyEvent(vehicle, tripLoad, input) {
+  if (!vehicle) return { ok: false, error: 'vehicle not found' };
+  if (!input.departure_time || !(input.departure_time instanceof Date)
+      || isNaN(input.departure_time.getTime())) {
+    return { ok: false, error: 'valid departure_time is required' };
+  }
+  // WR-01: only on an active/eligible trip.
+  if (!WALKABLE_VEHICLE_STATES.includes(vehicle.state)) {
+    return { ok: false, error: `vehicle is ${vehicle.state} — walk-ins need a dispatched trip` };
+  }
+  if (!['WALK_IN', 'NO_SHOW', 'CHECK_IN', 'ADJUSTMENT'].includes(input.event_type)) {
+    return { ok: false, error: 'event_type must be WALK_IN, NO_SHOW, CHECK_IN or ADJUSTMENT' };
+  }
+  const delta = input.event_type === 'WALK_IN' ? 1
+    : input.event_type === 'NO_SHOW' ? -1
+    : (input.seat_delta | 0 || 0);
+  if (input.event_type === 'ADJUSTMENT' && !delta) {
+    return { ok: false, error: 'ADJUSTMENT needs a non-zero seat_delta' };
+  }
+  // WR-02: never beyond capacity, never below zero.
+  const projected = vehicle.current_count + delta;
+  if (projected > vehicle.max_capacity) {
+    return { ok: false, error: 'vehicle is full — walk-in rejected' };
+  }
+  if (projected < 0) {
+    return { ok: false, error: 'seat count cannot go negative' };
+  }
+  // WR-06 bookkeeping input sanity: label or roll for walk-ins/no-shows.
+  if ((input.event_type === 'WALK_IN' || input.event_type === 'NO_SHOW')
+      && !input.student_label && !input.student_roll_number) {
+    return { ok: false, error: 'student name or roll number is required' };
+  }
+  // WR-02 continuation: a full departure (tripLoad) blocks walk-ins even when
+  // the vehicle-level count has headroom (per-departure capacity).
+  if (input.event_type === 'WALK_IN' && tripLoad !== undefined
+      && tripLoad >= vehicle.max_capacity) {
+    return { ok: false, error: 'that departure is already full' };
+  }
+  return { ok: true, seat_delta: delta, projected };
+}
+
+// Transactional: validate + guarded UPDATE (FR-07) + audit row (WR-05).
+async function coreRecordOccupancyEvent(input, actorRole) {
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [buses] = await conn.query(
+      'SELECT bus_number, route_pickup, route_dropoff, current_count, max_capacity, state '
+      + 'FROM buses WHERE bus_number = $1', [input.bus_number]);
+    const vehicle = buses[0];
+    const [loads] = await conn.query(
+      'SELECT COUNT(*)::int AS n FROM bus_assignments '
+      + 'WHERE bus_number = $1 AND departure_time = $2',
+      [input.bus_number, input.departure_time]);
+    const tripLoad = loads.length ? loads[0].n : undefined;
+
+    const v = validateOccupancyEvent(vehicle, tripLoad, input);
+    if (!v.ok) {
+      await conn.rollback();
+      return { ok: false, error: v.error };
+    }
+
+    // FR-07 guarded seat mutation (direction-aware).
+    if (v.seat_delta > 0) {
+      const [, inc] = await conn.query(
+        'UPDATE buses SET current_count = current_count + 1 '
+        + 'WHERE bus_number = $1 AND current_count < max_capacity', [input.bus_number]);
+      if (inc !== 1) {
+        await conn.rollback();
+        return { ok: false, error: 'vehicle filled concurrently — rejected' };
+      }
+    } else if (v.seat_delta < 0) {
+      await conn.query(
+        'UPDATE buses SET current_count = GREATEST(current_count - 1, 0) WHERE bus_number = $1',
+        [input.bus_number]);
+    }
+
+    await conn.query(
+      'INSERT INTO occupancy_events (bus_number, departure_time, event_type, seat_delta, '
+      + 'request_number, student_label, remark, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+      [input.bus_number, input.departure_time, input.event_type, v.seat_delta,
+       input.request_number || null, input.student_label || null,
+       input.remark || null, actorRole + ':' + (input.created_by || 'unknown')]);
+
+    // No-show (7.3): if tied to a real booking, release its assignment + seat.
+    if (input.event_type === 'NO_SHOW' && input.request_number) {
+      await conn.query(
+        "UPDATE pickup_requests SET status = 'REJECTED' "
+        + "WHERE request_number = $1 AND status = 'APPROVED'", [input.request_number]);
+      await conn.query(
+        'DELETE FROM bus_assignments WHERE request_number = $1', [input.request_number]);
+    }
+
+    await conn.commit();
+    return { ok: true, bus_number: input.bus_number, seat_delta: v.seat_delta,
+             occupancy: v.projected };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+// Trip log for the conductor's view: who is on this departure (app bookings)
+// plus recent occupancy events (walk-ins etc.).
+async function coreTripLog(busNumber, departureIso) {
+  const [manifest] = await db.query(
+    'SELECT r.request_number, r.pickup_place, r.dropoff_place, r.status, '
+    + 's.name AS student_name, s.roll_number, s.phone_number '
+    + 'FROM bus_assignments a JOIN pickup_requests r ON a.request_number = r.request_number '
+    + 'JOIN students s ON r.student_roll_number = s.roll_number '
+    + 'WHERE a.bus_number = $1 AND a.departure_time = $2 '
+    + 'ORDER BY r.request_number', [busNumber, departureIso]);
+  const [events] = await db.query(
+    'SELECT event_type, seat_delta, student_label, remark, created_by, created_at '
+    + 'FROM occupancy_events WHERE bus_number = $1 AND departure_time = $2 '
+    + 'ORDER BY created_at DESC LIMIT 50', [busNumber, departureIso]);
+  return { manifest_count: manifest.length, manifest, events };
+}
+
 module.exports = {
   coreLocationFromName, coreRouteIsValid,
   coreApproveRequest, coreRejectRequest, coreCompleteRequest,
   coreDispatchApprovedRequests, coreAssignApprovedRequests,
+  coreRecordOccupancyEvent, coreTripLog, validateOccupancyEvent,
   planDispatch, parseRequiredTime, parseCampusLocal, campusTimeToDate,
   BOOKING_CUTOFF_MINUTES, ASSIGNABLE_VEHICLE_STATES, DEFAULT_DISPATCH_OPTIONS,
-  CAMPUS_TZ_OFFSET_MINUTES,
+  CAMPUS_TZ_OFFSET_MINUTES, WALKABLE_VEHICLE_STATES,
 };

@@ -8,10 +8,11 @@
 --   005  admin-managed student passwords (must_change_password, audit stamp)
 --   006  dispatch engine (departure-scoped assignments)
 --   007  login rate limiting (login_failures table)
+--   008  conductor mode (occupancy_events + conductor role)
 -- Ends with a sanity-check query — expect buses_total=12, vans=6,
 -- schedules_total=24, van_departures=12, buses_vehicle_typed=12, reqs_typed=1,
 -- students_have_flags=1, assignments_have_departure_time=1,
--- login_failures_table=1.
+-- login_failures_table=1, occupancy_events_table=1, conductor_role=1.
 -- ============================================================================
 
 
@@ -225,11 +226,41 @@ CREATE INDEX IF NOT EXISTS idx_login_failures_window
 
 
 -- ============================================================================
+-- MIGRATION 008: conductor mode & occupancy truth (Phase 2)
+--   occupancy_events — audit trail for walk-ins / no-shows / check-ins /
+--   adjustments (who, when, trip, type, remark); `conductor` staff role.
+--   Walk-ins consume seats through the same FR-07 capacity guard.
+-- ============================================================================
+
+INSERT INTO credentials (role, password) VALUES ('conductor', 'admin')
+ON CONFLICT (role) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS occupancy_events (
+  event_id      BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  bus_number    INTEGER NOT NULL REFERENCES buses(bus_number),
+  departure_time TIMESTAMPTZ NOT NULL,
+  event_type    VARCHAR(20) NOT NULL
+                CHECK (event_type IN ('WALK_IN','NO_SHOW','CHECK_IN','ADJUSTMENT')),
+  seat_delta    INTEGER NOT NULL,
+  request_number INTEGER REFERENCES pickup_requests(request_number),
+  student_label VARCHAR(100),
+  remark        VARCHAR(200),
+  created_by    VARCHAR(60) NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_occupancy_trip
+  ON occupancy_events(bus_number, departure_time);
+CREATE INDEX IF NOT EXISTS idx_occupancy_created
+  ON occupancy_events(created_at);
+
+
+-- ============================================================================
 -- SANITY CHECK — the result grid after Run should show:
 --   buses_total 12 · vans 6 · schedules_total 24 · van_departures 12
 --   buses_vehicle_typed 12 · requests_have_required_time 1
 --   students_have_flags 1 · assignments_have_departure_time 1
---   login_failures_table 1
+--   login_failures_table 1 · occupancy_events_table 1 · conductor_role 1
 -- ============================================================================
 SELECT
   (SELECT COUNT(*) FROM buses)                                   AS buses_total,
@@ -248,4 +279,7 @@ SELECT
      WHERE table_name = 'bus_assignments'
        AND column_name = 'departure_time')                      AS assignments_have_departure_time,
   (SELECT COUNT(*) FROM information_schema.tables
-     WHERE table_name = 'login_failures')                       AS login_failures_table;
+     WHERE table_name = 'login_failures')                       AS login_failures_table,
+  (SELECT COUNT(*) FROM information_schema.tables
+     WHERE table_name = 'occupancy_events')                     AS occupancy_events_table,
+  (SELECT COUNT(*) FROM credentials WHERE role = 'conductor')   AS conductor_role;

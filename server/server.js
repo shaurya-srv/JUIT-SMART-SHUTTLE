@@ -11,6 +11,7 @@ const {
   coreLocationFromName, coreRouteIsValid,
   coreApproveRequest, coreRejectRequest, coreCompleteRequest,
   coreDispatchApprovedRequests,
+  coreRecordOccupancyEvent, coreTripLog,
   parseRequiredTime, BOOKING_CUTOFF_MINUTES,
 } = require('./lib/service');
 const { LOCATIONS, MAX_BUS_CAPACITY } = require('./lib/models');
@@ -101,7 +102,7 @@ app.post('/api/login', ah(async (req, res) => {
   try {
     if (role === 'student' && roll_number) {
       limiterAccount = ['student', String(roll_number)];
-    } else if (['guard', 'scheduler', 'admin'].includes(role)) {
+    } else if (['guard', 'scheduler', 'admin', 'conductor'].includes(role)) {
       limiterAccount = ['staff', role];
     }
     if (limiterAccount) {
@@ -142,7 +143,7 @@ app.post('/api/login', ah(async (req, res) => {
     return res.json({ token, role: 'student', roll_number, name: rows[0].name, must_change_password: mustChange });
   }
 
-  if (role === 'guard' || role === 'scheduler' || role === 'admin') {
+  if (role === 'guard' || role === 'scheduler' || role === 'admin' || role === 'conductor') {
     const [rows] = await db.query(
       'SELECT password FROM credentials WHERE role = $1', [role]);
     if (!rows.length || !pwVerify(password, rows[0].password)) {
@@ -260,9 +261,19 @@ app.get('/api/requests/mine', authenticate, requireRole('student'), ah(async (re
     + 'WHERE r.student_roll_number = $1 ORDER BY r.request_number DESC', [req.session.roll_number]);
 
   // Batch-fill bus assignments
-  const [assigns] = await db.query(
-    'SELECT a.request_number, a.bus_number, a.departure_time, b.vehicle_type '
-    + 'FROM bus_assignments a LEFT JOIN buses b ON a.bus_number = b.bus_number');
+  // Assignment data with graceful degradation when migration-006 columns
+  // are missing (production DB in limbo): fall back to base columns.
+  let assigns;
+  try {
+    assigns = (await db.query(
+      'SELECT a.request_number, a.bus_number, a.departure_time, b.vehicle_type '
+      + 'FROM bus_assignments a LEFT JOIN buses b ON a.bus_number = b.bus_number'))[0];
+  } catch (e) {
+    if (!/column .* does not exist/.test(e.message)) throw e;
+    assigns = (await db.query(
+      "SELECT request_number, bus_number, NULL AS departure_time, 'bus'::text AS vehicle_type "
+      + 'FROM bus_assignments'))[0];
+  }
   const assignMap = {};
   assigns.forEach(a => assignMap[a.request_number] = {
     bus: a.bus_number, departure: a.departure_time || null, vehicle_type: a.vehicle_type || 'bus',
@@ -311,9 +322,19 @@ app.get('/api/requests', authenticate, requireRole('guard', 'scheduler'), ah(asy
   query += ' ORDER BY r.request_number';
 
   const [rows] = await db.query(query, params);
-  const [assigns] = await db.query(
-    'SELECT a.request_number, a.bus_number, a.departure_time, b.vehicle_type '
-    + 'FROM bus_assignments a LEFT JOIN buses b ON a.bus_number = b.bus_number');
+  // Assignment data with graceful degradation when migration-006 columns
+  // are missing (production DB in limbo): fall back to base columns.
+  let assigns;
+  try {
+    assigns = (await db.query(
+      'SELECT a.request_number, a.bus_number, a.departure_time, b.vehicle_type '
+      + 'FROM bus_assignments a LEFT JOIN buses b ON a.bus_number = b.bus_number'))[0];
+  } catch (e) {
+    if (!/column .* does not exist/.test(e.message)) throw e;
+    assigns = (await db.query(
+      "SELECT request_number, bus_number, NULL AS departure_time, 'bus'::text AS vehicle_type "
+      + 'FROM bus_assignments'))[0];
+  }
   const assignMap = {};
   assigns.forEach(a => assignMap[a.request_number] = {
     bus: a.bus_number, departure: a.departure_time || null, vehicle_type: a.vehicle_type || 'bus',
@@ -508,12 +529,25 @@ app.get('/api/reports/capacity', authenticate, requireRole('guard', 'scheduler',
 // ============================================================
 
 // Timetable payload shared by the authenticated and public endpoints.
+// Degrades gracefully when migration-004 columns are missing (production DB
+// in limbo): falls back to base columns and label-sniffs vans, so the
+// timetable still works as soon as 002 seeds exist.
 async function timetablePayload() {
-  const [rows] = await db.query(
-    'SELECT s.schedule_id, s.bus_number, s.departure_time, s.label, '
-    + 'b.route_pickup, b.route_dropoff, b.current_count, b.max_capacity, b.vehicle_type '
-    + 'FROM bus_schedules s JOIN buses b ON s.bus_number = b.bus_number '
-    + 'ORDER BY s.departure_time, s.bus_number');
+  let rows;
+  try {
+    rows = (await db.query(
+      'SELECT s.schedule_id, s.bus_number, s.departure_time, s.label, '
+      + 'b.route_pickup, b.route_dropoff, b.current_count, b.max_capacity, b.vehicle_type '
+      + 'FROM bus_schedules s JOIN buses b ON s.bus_number = b.bus_number '
+      + 'ORDER BY s.departure_time, s.bus_number'))[0];
+  } catch (e) {
+    if (!/column .* does not exist/.test(e.message)) throw e;
+    rows = (await db.query(
+      'SELECT s.schedule_id, s.bus_number, s.departure_time, s.label, '
+      + 'b.route_pickup, b.route_dropoff, b.current_count, b.max_capacity '
+      + 'FROM bus_schedules s JOIN buses b ON s.bus_number = b.bus_number '
+      + 'ORDER BY s.departure_time, s.bus_number'))[0];
+  }
   const schedule = rows.map(r => ({
     schedule_id: r.schedule_id,
     bus_number: r.bus_number,
@@ -587,8 +621,8 @@ app.post('/api/admin/staff-password', authenticate, requireRole('admin'), ah(asy
   if (!role || !new_password) {
     return res.status(400).json({ error: 'role and new_password are required' });
   }
-  if (!['guard', 'scheduler', 'admin'].includes(role)) {
-    return res.status(400).json({ error: 'role must be guard, scheduler or admin' });
+  if (!['guard', 'scheduler', 'admin', 'conductor'].includes(role)) {
+    return res.status(400).json({ error: 'role must be guard, scheduler, admin or conductor' });
   }
   if (String(new_password).length < 8) {
     return res.status(400).json({ error: 'password must be at least 8 characters' });
@@ -748,6 +782,60 @@ app.delete('/api/admin/login-failures/:key', authenticate, requireRole('admin'),
   const [, rowCount] = await db.query('DELETE FROM login_failures WHERE identity_key = $1', [key]);
   if (!rowCount) return res.status(404).json({ error: 'identity not found (it may have already expired)' });
   res.json({ cleared: key });
+}));
+
+// ============================================================
+// Conductor mode (Phase 2): walk-ins, no-shows, check-ins (§7.15–7.17).
+// Guard or conductor may record events; scheduler/admin may read logs.
+// ============================================================
+
+const OCCUPANCY_ACTORS = ['guard', 'conductor', 'admin'];
+
+app.post('/api/occupancy', authenticate, requireRole(...OCCUPANCY_ACTORS), ah(async (req, res) => {
+  const { bus_number, departure_time, event_type, student_label,
+          student_roll_number, request_number, remark, seat_delta } = req.body || {};
+  const bn = parseInt(bus_number, 10);
+  if (!bn) return res.status(400).json({ error: 'bus_number is required' });
+  if (!departure_time) return res.status(400).json({ error: 'departure_time is required' });
+  const dep = parseCampusLocal(departure_time).ok
+    ? parseCampusLocal(departure_time).date : new Date(departure_time);
+  if (isNaN(dep.getTime())) return res.status(400).json({ error: 'departure_time is not a valid date' });
+  const roll = student_roll_number ? parseInt(student_roll_number, 10) : null;
+  if (student_roll_number && !roll) {
+    return res.status(400).json({ error: 'student_roll_number must be numeric' });
+  }
+  try {
+    const result = await coreRecordOccupancyEvent({
+      bus_number: bn,
+      departure_time: dep,
+      event_type: String(event_type || '').toUpperCase(),
+      student_label: student_label ? String(student_label).slice(0, 100) : null,
+      student_roll_number: roll,
+      request_number: request_number ? parseInt(request_number, 10) : null,
+      remark: remark ? String(remark).slice(0, 200) : null,
+      seat_delta: seat_delta !== undefined ? parseInt(seat_delta, 10) || 0 : 0,
+      created_by: req.session.role === 'conductor' ? ('conductor-' + (req.session.name || '')) : req.session.role,
+    }, req.session.role);
+    if (!result.ok) return res.status(409).json({ error: result.error });
+    res.status(201).json(result);
+  } catch {
+    res.status(500).json({ error: 'database error during occupancy event' });
+  }
+}));
+
+app.get('/api/occupancy/trip/:bus_number', authenticate,
+  requireRole('guard', 'conductor', 'scheduler', 'admin'), ah(async (req, res) => {
+  const bn = parseInt(req.params.bus_number, 10);
+  const dep = new Date(req.query.departure_time || '');
+  if (!bn || isNaN(dep.getTime())) {
+    return res.status(400).json({ error: 'bus_number path param and departure_time query param are required' });
+  }
+  try {
+    const log = await coreTripLog(bn, dep.toISOString());
+    res.json({ bus_number: bn, departure_time: dep.toISOString(), ...log });
+  } catch {
+    res.status(500).json({ error: 'database error reading trip log' });
+  }
 }));
 
 // Central error handler — target of the ah() wrapper above.

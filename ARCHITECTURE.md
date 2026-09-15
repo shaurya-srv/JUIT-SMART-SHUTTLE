@@ -187,7 +187,22 @@ Status values: `PENDING_APPROVAL`, `APPROVED`, `REJECTED`, `COMPLETED`.
   `datetime-local` values are parsed as IST wall-clock (`parseCampusLocal`),
   and timetable `HH:MM` strings convert via `campusTimeToDate`.
 
-## 7. Known gaps / backlog
+## 7. Conductor mode (Phase 2)
+A fifth staff role, `conductor` (migration 008 seeds it — change the bootstrap
+password), records on-vehicle reality against a **dispatched** departure:
+- `POST /api/occupancy` (guard/conductor/admin) — `WALK_IN` (+1 seat),
+  `NO_SHOW` (−1 seat, rejects the booking and frees the assignment),
+  `CHECK_IN`, `ADJUSTMENT` (explicit delta). Every event lands in
+  `occupancy_events` with actor + remark (WR-05).
+- WR-01: only vehicles in `DISPATCHED`/`ON_TRIP` accept events.
+- WR-02: seats move through the FR-07 guarded UPDATE both directions and
+  respect the per-departure cap, never below zero.
+- `GET /api/occupancy/trip/:bus_number?departure_time=...` — manifest of
+  booked students + recent events, for the conductor's tablet.
+- Pure validator (`validateOccupancyEvent`) is unit-tested in
+  `server/tests/occupancy.test.js` (18 checks).
+
+## 8. Known gaps / backlog
 - ~~`POST /api/reset-password` is unauthenticated~~ — **removed.** Student
   passwords are admin-managed: bulk import with a default password, forced
   one-time change at first login (`students.must_change_password`, enforced in
@@ -197,7 +212,7 @@ Status values: `PENDING_APPROVAL`, `APPROVED`, `REJECTED`, `COMPLETED`.
 - No login rate limiting (brute-force protection for staff passwords).
 - `SHUTTLE_DB_PASS` rotation pending (old password appeared in chat).
 
-## 8. Legacy system (archived)
+## 9. Legacy system (archived)
 The project began as a C application: CLI portals (`legacy/src/cli`),
 a business-rule core (`legacy/src/core`), a MySQL data layer, and a winsock2
 HTTP/JSON server (`legacy/src/api`) with its own test suite
