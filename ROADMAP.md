@@ -2,8 +2,8 @@
 
 > Tracks the **JUIT Smart Shuttle PRD** (baseline + planned Intelligent Dispatch
 > Optimization) against this repository. PRD sections are referenced as §n.
-> Last verified against the code: **2026-09-14** — 22 Express routes,
-> migrations 001–004 present, service exports confirmed.
+> Last verified against the code: **2026-09-15** — 26 Express routes,
+> migrations 001–007 present (plus the combined `apply_all_pending.sql`).
 
 **Status legend:** ✅ implemented · 🟡 partial · ❌ not started · 🔶 exists but needs hardening before real students onboard
 
@@ -16,11 +16,11 @@
 | Baseline roles & request lifecycle (§2–5) | ✅ | All four roles, full lifecycle with preconditions |
 | Functional requirements FR-01–08, 12–15 (§7) | ✅ | Auth, requests, capacity guard, auto-assign, timetable, reports, staff passwords |
 | FR-03 booking cutoff | ✅ | Built on top of baseline (optional `required_time`) |
-| Dispatch optimizer (§6, FR-09–11) | ❌ | Foundation ready, engine not started |
+| Dispatch optimizer (§6, FR-09–11) | ✅ v1 | Engine ships: pools by route+deadline, fills scheduled departures, van/bus sizing, decision log |
 | Dynamic active-trip insertion (FR-16–17) | ❌ | Needs the trips entity |
 | Conductor mode & walk-ins (§4.5, §7.15–7.17, WR-01–07) | ❌ | Role model ready to extend |
 | Live GPS tracking (§7.18–7.26) | ❌ | Highest-risk PRD area (their own backlog flags it) |
-| Non-functional requirements (§8) | ✅ / 🔶 | Core NFRs met; reset hardening **done** — rate limiting outstanding |
+| Non-functional requirements (§8) | ✅ | Core NFRs met; reset hardening + login rate limiting **done**; DB password rotation outstanding |
 
 ---
 
@@ -36,13 +36,14 @@
 | FR-06 | Scheduler registers vehicles with route + capacity | ✅ | `POST /api/buses`; also accepts `vehicle_type` (bus/van, PRD §6.8) |
 | FR-07 | Never assign beyond registered capacity | ✅ | Atomic capacity-guarded `UPDATE ... WHERE current_count < max_capacity`; same guard to be reused by walk-ins (WR-02) |
 | FR-08 | Automatic route-compatible assignment | ✅ | First-fit by lowest bus number on exact route; now restricted to `state = 'AVAILABLE'` (§7.13) |
-| FR-09 | Optimizer combines requests into fewer trips | ❌ | Phase 1. Requires consuming `required_time` (stored, unused) |
-| FR-10 | Prefer existing feasible trips | ❌ | Phase 1 — scheduled timetable departures become the first "existing trips" |
-| FR-11 | Select vehicle size by demand | ❌ | Phase 1 — rule: 3–6 students → van, >6 → bus (§6.8); never exceed capacity |
+| FR-09 | Optimizer combines requests into fewer trips | ✅ v1 | `planDispatch()` pools approved requests per (route, window); fills existing departures before needing new ones. Full trip-merging economics land with Phase 4 (7.2) |
+| FR-10 | Prefer existing feasible trips | ✅ v1 | Scheduled timetable departures **are** the trips (one capacity per `(bus, departure_time)`); earliest feasible filled first |
+| FR-11 | Select vehicle size by demand | ✅ v1 | Equal-departure tie-break prefers a right-sized van (3–6 seats) over a bus; per-departure capacity never exceeded |
 | FR-12 | Timetable + live capacity to students | ✅ | `GET /api/timetable` (auth) + `GET /api/timetable/public` (no auth) + 60 s live refresh on the login-screen view (in-place repaint, generation guard, visibility catch-up) |
 | FR-13 | Guard completes rides, frees seats | ✅ | `POST /api/requests/:id/complete`; seat decremented, assignment history kept |
 | FR-14 | Scheduler monitors route capacity | ✅ | `GET /api/reports/capacity` (per-route assigned/capacity/available) |
 | FR-15 | Admin manages staff passwords in-app | ✅ | `GET /api/admin/staff`, `POST /api/admin/staff-password` (min 8 chars, hashed) |
+| — | **Beyond PRD:** admin-managed student accounts | ✅ | Public reset removed; bulk import (`POST /api/admin/students`), shared default password, forced first-login change (`must_change_password`, enforced in middleware), admin-only reset (`POST /api/admin/students/:roll/password`) |
 | FR-16 | Add approved requests to active/dispatched trips when feasible | ❌ | Phase 3 (needs `trips` entity + active-trip state) |
 | FR-17 | Reject unsafe dynamic insertion (capacity / detour / service window) | ❌ | Phase 3 — hard constraints must fail safely into the normal request flow |
 
@@ -67,16 +68,16 @@
 | PRD | Feature | Status | Notes / Acceptance criteria |
 |---|---|---|---|
 | 6.1 | 30-min booking cutoff | ✅ | See FR-03 |
-| 6.2 | Planning window | 🟡 | Window exists implicitly (cutoff → departure); no process consumes it yet |
-| 6.3 | Optimization objective & priorities | ❌ | Phase 1 — order: safety/capacity → student times → route compatibility → existing trips → fewest trips → smallest vehicle |
-| 6.4 | Shared-trip grouping | ❌ | Phase 1 — group by (direction, route segment, time window) |
-| 6.5 | Earliest-deadline constraint | ❌ | Phase 1 — group dispatch time = earliest `required_time`; **not** an average |
-| 6.6 | Existing-trip-first policy | ❌ | Phase 1 — check seeded timetable departures (later: planned trips) before creating new ones |
+| 6.2 | Planning window | ✅ | The window (booking cutoff → required_time) drives dispatch: only departures within `[need − earliness, need + delay]` are eligible |
+| 6.3 | Optimization objective & priorities | ✅ v1 | Order enforced: capacity/safety (hard) → student windows (hard) → earliest feasible departure → right-sized vehicle → fewest vehicles |
+| 6.4 | Shared-trip grouping | ✅ v1 | Requests sharing a feasible departure naturally pool onto it (per-departure seat accounting) |
+| 6.5 | Earliest-deadline constraint | ✅ v1 | Requests processed earliest-`required_time`-first; the constrained seat always goes to the tightest deadline (tested) |
+| 6.6 | Existing-trip-first policy | ✅ v1 | Only scheduled departures are used in v1; nothing new is invented |
 | 6.7 | On-route dynamic pickup/drop addition | ❌ | Phase 3 — insertion engine with hard constraints (FR-17) |
-| 6.8 | Vehicle selection (van 3–6, bus >6) | 🟡 | `vehicle_type` column + capacity caps exist; sizing rule not applied |
-| 6.9 | Maximum acceptable delay | ❌ | Phase 1 — scheduler-configurable window; never schedule later on purpose |
-| 6.10 | Trip cost/score comparison | ❌ | Phase 1 — keep-existing vs new-trip score (operating cost, distance, waiting, lateness) |
-| 6.11 | Recommended dispatch flow (11 steps) | ❌ | Phase 1 implements steps 1–11 minus active-trip steps (those land in Phase 3) |
+| 6.8 | Vehicle selection (van 3–6, bus >6) | ✅ v1 | `seatRank()`: right-sized van < bus < undersized at equal departure; scheduler picks windows per run |
+| 6.9 | Maximum acceptable delay | ✅ v1 | `max_delay_minutes` (default 30) + `max_earliness_minutes` (default 60) enforced in the planner; scheduler-prompted each run |
+| 6.10 | Trip cost/score comparison | 🟡 | Implicit (earliest-first keeps later runs free); formal cost scoring deferred to Phase 4 |
+| 6.11 | Recommended dispatch flow | ✅ v1 | `POST /api/buses/assign` runs pooling → windowing → sizing → guarded writes → DISPATCHED transitions; active-trip steps land in Phase 3 |
 
 ---
 
@@ -93,10 +94,10 @@
 | 7.7 | Route-insertion decision engine | ❌ | Phase 3 (formalized 6.7) |
 | 7.8 | Priority / emergency requests | ❌ | Staff-only flag; relaxes cost rules, never capacity/safety |
 | 7.9 | Trip efficiency dashboard | ❌ | Phase 4 — trips run, occupancy, trips avoided, est. savings |
-| 7.10 | Explainable dispatch decisions | 🟡 | Assignment report counts reasons; decision-level explanations land with the optimizer |
+| 7.10 | Explainable dispatch decisions | ✅ v1 | Dispatch report renders a per-request decision log (vehicle, departure, reason) + per-departure fill counts |
 | 7.11 | Fairness / anti-starvation | ❌ | Max-wait threshold forces dispatch even when uneconomical |
 | 7.12 | Route utilization & dead-trip detection | ❌ | Phase 4 — flags low-occupancy departures & empty return legs |
-| 7.13 | Vehicle operational state | 🟡 | Column + CHECK constraint + auto-assign guard + `PATCH /api/buses/:n/state` + UI badges; **missing:** automatic `DISPATCHED`/`ON_TRIP` transitions during dispatch |
+| 7.13 | Vehicle operational state | ✅ v1 | Column + CHECK + auto-assign guard + `PATCH .../state` + UI; dispatch now auto-sets `DISPATCHED` on used vehicles (`ON_TRIP` arrives with Phase 3 GPS) |
 | 7.14 | Maintenance tracking | 🟡 | `last_service`/`next_service` columns exist; no UI, no auto-exclusion by date |
 | 7.15–7.17 | Walk-ins & manual seat adjustments | ❌ | Phase 2 (see WR table) |
 | 7.18–7.26 | Live tracking, conductor GPS mode, join-running-bus | ❌ | Phase 3 — riskiest area: stale-location handling, privacy (§7.25), guardrails (§7.23) |
@@ -114,9 +115,9 @@
 | Responsive browser UI | ✅ | Mobile-first vanilla SPA |
 | Vercel deploy + health monitoring | ✅ | `GET /api/health`; git-push deploys |
 | UI / API / business-rule separation | ✅ | Business rules in `server/lib/service.js` |
-| Traceable scheduling decisions | 🟡 | Reports exist; decision audit arrives with the optimizer |
+| Traceable scheduling decisions | ✅ | Dispatch report logs a per-request decision (vehicle, departure, reason) |
 | **Password reset hardening** | ✅ | Public reset **removed**; admin-managed passwords: bulk import, default password, forced first-login change (`must_change_password`), admin-only reset |
-| **Login rate limiting** | ❌ | Brute-force protection for staff passwords |
+| **Login rate limiting** | ✅ | DB-backed sliding window (global across serverless instances): 8 fails / 15 min per account, 30 / 15 min per IP; 429 + Retry-After; fail-open on limiter outage |
 | **DB password rotation** | ❌ | Old credential appeared in chat; rotate in Supabase + Vercel |
 
 ---
@@ -124,17 +125,21 @@
 ## 7. Recommended Build Order
 
 ### Phase 0 — Ship what exists (now)
-1. Apply migrations **002–005** in Supabase SQL Editor (idempotent; or the combined `server/migrations/apply_all_pending.sql`).
-2. Deploy (`git push`), verify `/api/timetable/public` returns 24 departures and the login-screen live view works.
-3. Security quick wins before students arrive: ~~protect reset-password~~ (done — admin-managed), add login rate limiting, rotate `SHUTTLE_DB_PASS`.
+1. **Two-database split — DECIDED 2026-09-15:** the **old project** stays the production DB (Vercel's pooler user `postgres` resolves there). The new project (`afydafeurljiqlnydywh`) is retired once `apply_all_pending.sql` has been run on the old one and production verifies green. The new project's copy of the data is a scratch copy — do not repoint Vercel to it.
+2. Apply migrations **002–005** on the **old** project via `server/migrations/apply_all_pending.sql` (idempotent).
+3. Security quick wins before students arrive: ~~protect reset-password~~ (done — admin-managed), ~~login rate limiting~~ (done — `login_failures` table), rotate `SHUTTLE_DB_PASS`.
 
-### Phase 1 — Dispatch engine v1 (FR-09/10/11, §6.3–6.11, finishes 7.13)
-- Consume `required_time`: pool APPROVED requests by (direction, route); sort by earliest deadline.
-- Treat **scheduled timetable departures as existing trips** (6.6) — assign groups into them first.
-- Van for 3–6 students, bus for >6 (6.8); never exceed capacity; respect per-student max delay (6.9).
-- Output an **explainable decision report** (7.10): per request — which trip, why, what was skipped.
-- Auto-set vehicle state `DISPATCHED` at dispatch time (completes 7.13).
-- *Acceptance:* seeded timetable + a batch of approved requests → "Run Dispatch" fills the 07:45/08:15 departures by route, picks vans for small groups, produces a per-request decision log, and never over-caps or schedules past a max-delay window.
+### Phase 1 — ~~Dispatch engine v1~~ ✅ DONE (2026-09-15)
+Shipped: `planDispatch()` (pure, 24-test suite in `server/tests/dispatch.test.js`) + transactional applier `coreDispatchApprovedRequests()`; scheduled departures as per-departure-capped trips; earliest-deadline-first; van/bus sizing tie-break; scheduler-configurable `max_delay_minutes`/`max_earliness_minutes` (30/60); per-request decision log in the UI; FR-07 guarded writes; `DISPATCHED` auto-transition; `bus_assignments.departure_time` (migration 006 — run it in Supabase). Also fixed: datetime-local inputs are now interpreted as IST campus time, not server-UTC.
+Remaining from the original Phase 1 list: none blocking; trip-merging economics (7.2) and cost scoring (6.10) are Phase 4.
+
+### Phase 0.5 — Go-live dry run (checklist for the day before students arrive)
+1. **Import a real batch** — Admin → Students & Passwords → paste roll numbers + names → set the default password → Import. Confirm the report says how many imported vs skipped.
+2. **Hand out the default in person** (notice board / WhatsApp screenshot in person — never a broadcast group). Do NOT send it in a way a stranger could see.
+3. **Watch one forced change** — a student logs in with the default → the "Set your password" screen appears → they change it → portal opens. Verify the badge flips to "active" in the admin student list.
+4. **Exercise admin reset** — have one student "forget"; admin resets from the student row; student logs in with the new default and changes it again.
+5. **Run Dispatch** — approve a handful of test requests, scheduler runs Dispatch with default windows; check the report reads sensibly and My Requests shows "Your ride: Bus #X — the 7:45 AM run".
+6. **Check Login Security** — intentionally fat-finger a password 8 times; confirm the account blocks, the admin monitor shows it, unblock works.
 
 ### Phase 2 — Conductor mode & occupancy truth (§4.5, §7.3–7.5, §7.15–7.17, WR-01–07)
 - `conductor` role; walk-in recording, no-show marking, boarding check-in; `occupancy_events` audit table.
@@ -157,7 +162,10 @@
 - Migrations are idempotent and applied via SQL Editor (DB credentials are Vercel-Sensitive — the CLI cannot pull them).
 
 ## 9. Verification status of shipped work
-- `node --check` clean on `server/server.js`, `server/lib/service.js`, and the inline frontend script.
+- `node --check` clean on all server files and the inline frontend script.
+- **Automated test suites** (`node server/tests/*.test.js`): dispatch planner 24 checks; rate limiter 18 checks — all passing.
+- Admin-managed passwords: 17 behavioral checks against the real app (route removal, role gates, import validation, and the must-change-password middleware gate) — all passing.
+- Phase 0.5 shipped: student "Your ride" card, admin Login Security monitor (`GET/DELETE /api/admin/login-failures`), go-live dry-run checklist (above).
 - FR-03: 10 scenarios tested (boundary, past, invalid, skew margins).
 - Timetable/live-refresh: 8 next-departure scenarios + 7 poller behaviors tested (initial paint, stale-fetch discard, failure/retry, mode toggle, timer teardown).
-- No automated test suite yet — worth adding (node:test) as Phase 1 lands, since the optimizer is exactly the kind of code that needs regression tests.
+- **Pending deploy:** the dispatch engine + rate limiter code and migrations 006–007 are committed locally but not yet pushed; `apply_all_pending.sql` (002–007) has not been run on the old (production) project.

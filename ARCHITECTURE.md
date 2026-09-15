@@ -91,6 +91,13 @@ PENDING_APPROVAL ──guard──► APPROVED ──guard──► COMPLETED (s
 - **Safety**: parameterized queries only, 4 KB JSON body limit, every async
   route wrapped (`ah()`) so a DB error returns a clean 500 instead of killing
   the serverless function
+- **Login rate limiting** (`server/lib/ratelimit.js`, migration 007): failed
+  logins counted in the `login_failures` table — 8 per account / 15 min,
+  30 per source IP / 15 min (NAT-tolerant for campus WiFi). Blocked attempts
+  get HTTP 429 + `Retry-After`. Counters live in Postgres because serverless
+  instances are ephemeral; the limiter fails open if the DB hiccups (an
+  outage must never lock the campus out). Successful logins clear the
+  account counter; the IP counter only ages out with its window.
 - **DB access**: `server/lib/db.js` wraps `pg` to return `[rows, rowCount]`
   (update/insert code must read `rowCount` — the approve/reject/assign
   bug class we fixed)
@@ -162,7 +169,25 @@ Status values: `PENDING_APPROVAL`, `APPROVED`, `REJECTED`, `COMPLETED`.
 3. The Supabase user on the pooler is `postgres.<ref>`, not `postgres`.
 4. Express 4 does not catch async throws — every route stays wrapped in `ah()`.
 
-## 6. Known gaps / backlog
+## 6. Dispatch engine (v1)
+`server/lib/service.js` splits the optimizer into a **pure planner** and a
+**transactional applier**:
+- `planDispatch(requests, vehicles, schedules, tripLoads, now, options)` —
+  pools APPROVED requests earliest-`required_time`-first, matches each against
+  scheduled departures (each `(bus, departure_time)` is an independently
+  capped trip), enforces the `max_delay_minutes` (30) / `max_earliness_minutes`
+  (60) windows, prefers right-sized vans at equal departures, and returns a
+  per-request decision log. Fully unit-tested (`server/tests/dispatch.test.js`, 24 checks).
+- `coreDispatchApprovedRequests(options)` — loads live data, plans, writes
+  assignments with the FR-07 guarded UPDATE, records `departure_time` per
+  assignment, and flips used vehicles to `DISPATCHED`. Re-runnable: prior
+  per-departure loads are honored.
+- `POST /api/buses/assign` accepts `{ max_delay_minutes, max_earliness_minutes }`.
+- Campus time: JUIT is IST (UTC+05:30) while Vercel runs UTC — naive
+  `datetime-local` values are parsed as IST wall-clock (`parseCampusLocal`),
+  and timetable `HH:MM` strings convert via `campusTimeToDate`.
+
+## 7. Known gaps / backlog
 - ~~`POST /api/reset-password` is unauthenticated~~ — **removed.** Student
   passwords are admin-managed: bulk import with a default password, forced
   one-time change at first login (`students.must_change_password`, enforced in
@@ -172,7 +197,7 @@ Status values: `PENDING_APPROVAL`, `APPROVED`, `REJECTED`, `COMPLETED`.
 - No login rate limiting (brute-force protection for staff passwords).
 - `SHUTTLE_DB_PASS` rotation pending (old password appeared in chat).
 
-## 7. Legacy system (archived)
+## 8. Legacy system (archived)
 The project began as a C application: CLI portals (`legacy/src/cli`),
 a business-rule core (`legacy/src/core`), a MySQL data layer, and a winsock2
 HTTP/JSON server (`legacy/src/api`) with its own test suite

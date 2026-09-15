@@ -648,8 +648,30 @@ async function showStudentStatus() {
   if (!rows.length) {
     html += `<div class="empty-state"><div class="icon">📭</div><p>No requests yet.</p></div>`;
   } else {
+    // Your-ride card: the next approved+assigned request gets the big visual.
+    const ride = rows.find(r => r.status === 'APPROVED' && r.bus);
+    if (ride) {
+      const icon = ride.vehicle_type === 'van' ? '🚐 Van' : '🚌 Bus';
+      const depTime = ride.departure_label ||
+        (ride.departure ? new Date(ride.departure).toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' }) : '');
+      const needBy = ride.required_time
+        ? `Needed by ${new Date(ride.required_time).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}`
+        : '';
+      html += `
+        <div class="card" style="background:linear-gradient(135deg,#e8f0fe,#f1f8e9);border-color:var(--primary)">
+          <div class="row" style="align-items:center">
+            <span style="font-size:1.6rem">${icon}</span>
+            <div style="flex:1">
+              <div style="font-weight:800;font-size:1.05rem">Your ride: ${icon} #${ride.bus}${depTime ? ` — the ${depTime} run` : ''}</div>
+              <div class="text-muted">${ride.pickup} → ${ride.dropoff}${needBy ? ' · ' + needBy : ''}</div>
+            </div>
+            <span class="badge badge-approved">CONFIRMED</span>
+          </div>
+        </div>`;
+    }
     rows.forEach(r => {
-      const busLabel = r.bus ? `Bus #${r.bus}` : 'Not assigned';
+      const icon = r.vehicle_type === 'van' ? '🚐 Van' : 'Bus';
+      const busLabel = r.bus ? `${icon} #${r.bus}${r.departure_label ? ' — ' + r.departure_label + ' IST' : ''}` : 'Not assigned';
       const when = r.required_time ? `<div class="text-muted">⏰ Needed by: ${new Date(r.required_time).toLocaleString()}</div>` : '';
       html += `
         <div class="list-item">
@@ -768,7 +790,7 @@ async function showRequestList(status, title, back = 'showGuardPortal') {
         </div>
         <div class="value">${r.student_name} (Roll: ${r.roll_number})</div>
         <div>${r.pickup} → ${r.dropoff}</div>
-        ${r.bus ? `<div class="text-muted">🚌 Bus #${r.bus}</div>` : ''}
+        ${r.bus ? `<div class="text-muted">${r.vehicle_type === 'van' ? '🚐 Van' : '🚌 Bus'} #${r.bus}${r.departure_label ? ' — ' + r.departure_label + ' IST' : ''}</div>` : ''}
         ${status === 'APPROVED' ? `<button class="btn btn-success btn-sm" onclick="completeRide(${r.request_number})">🏁 Complete Ride</button>` : ''}
       </div>`;
   });
@@ -842,16 +864,51 @@ async function registerBus() {
 }
 
 async function doAutoAssign(back = 'showBusSchedulerPortal') {
+  const delayMin = prompt('Maximum minutes a student may be scheduled LATER than their requested time:', '30');
+  if (delayMin === null) return;
+  const earlyMin = prompt('Maximum minutes a student may be scheduled EARLIER than their requested time:', '60');
+  if (earlyMin === null) return;
   try {
-    const r = await apiCall('POST', '/api/buses/assign', {}, true);
-    let msg = `${r.assigned_count} request(s) assigned.`;
-    if (r.no_bus_available) msg += ` ${r.no_bus_available} could not be placed (no matching bus or all full).`;
-    if (r.warned_bus_numbers && r.warned_bus_numbers.length) msg += ` ⚠️ Buses at 80%+ capacity: ${r.warned_bus_numbers.map(b => '#' + b).join(', ')}`;
-    alert(msg);
-    window[back]();
+    const r = await apiCall('POST', '/api/buses/assign', { max_delay_minutes: parseInt(delayMin) || 30, max_earliness_minutes: parseInt(earlyMin) || 60 }, true);
+    showDispatchReport(r, back);
   } catch (e) {
-    alert(e.message);
+    alert('Dispatch failed: ' + e.message);
   }
+}
+
+function showDispatchReport(r, back) {
+  let html = backLink(back) + `
+    <div class="card">
+      <h2><span class="icon">🧭</span>Dispatch Report</h2>
+      <div class="row stats-grid">
+        <div class="stat"><span class="value">${r.assigned_count}</span><span class="label">assigned</span></div>
+        <div class="stat"><span class="value">${r.no_bus_available + (r.missing_required_time || 0)}</span><span class="label">unassigned</span></div>
+        <div class="stat"><span class="value">${r.trips_used ? r.trips_used.length : 0}</span><span class="label">departures used</span></div>
+        <div class="stat"><span class="value">${r.vehicles_dispatched ? r.vehicles_dispatched.length : 0}</span><span class="label">vehicles dispatched</span></div>
+      </div>
+      ${r.warned_bus_numbers && r.warned_bus_numbers.length ? `<div class="alert alert-warn">⚠️ Near capacity: vehicle(s) ${r.warned_bus_numbers.map(b => '#' + b).join(', ')}</div>` : ''}
+    </div>`;
+  if (r.trips_used && r.trips_used.length) {
+    html += `<div class="card"><h2><span class="icon">🕒</span>Departures Filled</h2>`;
+    r.trips_used.forEach(t => {
+      html += `<div class="list-item"><div class="row">
+        <span class="value">${t.vehicle_type === 'van' ? '🚐 Van' : '🚌 Bus'} #${t.bus_number} — ${t.label} IST</span>
+        <span class="badge badge-approved">${t.seats_booked}/${t.capacity}</span>
+      </div></div>`;
+    });
+    html += '</div>';
+  }
+  html += `<div class="card"><h2><span class="icon">🧾</span>Per-Request Decisions</h2>`;
+  const rows = (r.decisions || []);
+  if (!rows.length) html += '<div class="empty-state"><div class="icon">✅</div><p>Nothing to dispatch — no unassigned approved requests.</p></div>';
+  rows.forEach(d => {
+    const when = d.required_time ? new Date(d.required_time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : '';
+    html += d.status === 'assigned'
+      ? `<div class="list-item"><div class="row"><span class="value">✅ #${d.request_number} → ${d.vehicle_type === 'van' ? '🚐 Van' : '🚌 Bus'} #${d.bus_number}</span><span class="label">needed by ${when}</span></div><div class="label">${d.reason}</div></div>`
+      : `<div class="list-item"><div class="row"><span class="value">❌ #${d.request_number}</span><span class="label">${when}</span></div><div class="label">${d.reason}</div></div>`;
+  });
+  html += '</div>';
+  render(html);
 }
 
 async function showBusSchedule(back = 'showBusSchedulerPortal') {
@@ -1210,6 +1267,7 @@ function showAdminPortal() {
       <div class="menu-grid">
         <div class="menu-btn" onclick="showStaffManagement()"><span class="menu-icon">🔑</span>Staff Accounts</div>
         <div class="menu-btn" onclick="showStudentAccounts()"><span class="menu-icon">🎓</span>Students &amp; Passwords</div>
+        <div class="menu-btn" onclick="showLoginSecurity()"><span class="menu-icon">🛡️</span>Login Security</div>
         <div class="menu-btn" onclick="showTimetableEditor('showAdminPortal')"><span class="menu-icon">🕒</span>Edit Timetable</div>
         <div class="menu-btn" onclick="showBusSchedule('showAdminPortal')"><span class="menu-icon">📊</span>Bus Schedule</div>
         <div class="menu-btn" onclick="doAutoAssign('showAdminPortal')"><span class="menu-icon">🔄</span>Auto-Assign</div>
@@ -1362,6 +1420,56 @@ async function doResetStudentPassword(roll, name) {
     showStudentAccounts();
   } catch (e) {
     alert('Reset failed: ' + e.message);
+  }
+}
+
+// ---------- ADMIN: LOGIN SECURITY (brute-force monitor) ----------
+async function showLoginSecurity() {
+  render(backLink('showAdminPortal') + `<div class="card"><h2><span class="icon">🛡️</span>Login Security</h2><div class="empty-state"><div class="icon">⏳</div><p>Loading…</p></div></div>`);
+  let data;
+  try {
+    data = await apiCall('GET', '/api/admin/login-failures', undefined, true);
+  } catch (e) {
+    return render(backLink('showAdminPortal') + `<div class="card"><div class="alert alert-error">${e.message}</div></div>`);
+  }
+  let html = backLink('showAdminPortal') + `
+    <div class="card">
+      <h2><span class="icon">🛡️</span>Login Security</h2>
+      <p style="margin:4px 0 0">${data.count} identit${data.count === 1 ? 'y' : 'ies'} with failed attempts · <strong style="color:${data.blocked_count ? 'var(--danger)' : 'inherit'}">${data.blocked_count} blocked now</strong></p>
+      <p class="text-muted" style="margin-top:4px">Auto-rules: 8 fails / 15 min per account · 30 fails / 15 min per network. Blocks lift automatically when the window slides.</p>
+    </div>`;
+  if (!data.entries.length) {
+    html += `<div class="card"><div class="empty-state"><div class="icon">✅</div><p>No failed logins recorded. All quiet.</p></div></div>`;
+  } else {
+    html += '<div class="card">';
+    data.entries.forEach(e => {
+      const who = e.kind === 'ip'
+        ? `🌐 network ${e.id}`
+        : `${e.kind === 'student' ? '🎓' : '👤'} ${e.kind} ${e.id}`;
+      html += `<div class="list-item">
+        <div class="row">
+          <span class="value">${who}</span>
+          ${e.blocked
+            ? `<span class="badge badge-rejected">BLOCKED until ${new Date(e.blocked_until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>`
+            : `<span class="badge badge-pending">${e.fail_count} fails</span>`}
+        </div>
+        <div class="row" style="margin-top:2px">
+          <span class="label">window started ${new Date(e.window_start).toLocaleString()}</span>
+          <button class="btn btn-outline btn-sm" onclick="unblockIdentity('${e.identity_key}')">🔓 Unblock</button>
+        </div>
+      </div>`;
+    });
+    html += '</div>';
+  }
+  render(html);
+}
+
+async function unblockIdentity(key) {
+  try {
+    await apiCall('DELETE', '/api/admin/login-failures/' + encodeURIComponent(key), undefined, true);
+    showLoginSecurity();
+  } catch (e) {
+    alert('Unblock failed: ' + e.message);
   }
 }
 

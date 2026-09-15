@@ -6,10 +6,11 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const db = require('./lib/db');
 const { pwHash, pwVerify, randomBytes } = require('./lib/crypto');
+const { clientIp, checkLoginAllowed, recordLoginFailure, clearLoginFailures } = require('./lib/ratelimit');
 const {
   coreLocationFromName, coreRouteIsValid,
   coreApproveRequest, coreRejectRequest, coreCompleteRequest,
-  coreAssignApprovedRequests,
+  coreDispatchApprovedRequests,
   parseRequiredTime, BOOKING_CUTOFF_MINUTES,
 } = require('./lib/service');
 const { LOCATIONS, MAX_BUS_CAPACITY } = require('./lib/models');
@@ -93,6 +94,31 @@ app.post('/api/login', ah(async (req, res) => {
     return res.status(400).json({ error: 'role and password are required' });
   }
 
+  // Brute-force guard (DB-backed, global across serverless instances):
+  // 8 fails / 15 min per account, 30 / 15 min per source IP. Best-effort —
+  // a limiter outage never locks the school out.
+  let limiterAccount = null;
+  try {
+    if (role === 'student' && roll_number) {
+      limiterAccount = ['student', String(roll_number)];
+    } else if (['guard', 'scheduler', 'admin'].includes(role)) {
+      limiterAccount = ['staff', role];
+    }
+    if (limiterAccount) {
+      await checkLoginAllowed(limiterAccount[0], limiterAccount[1], clientIp(req));
+    }
+  } catch (e) {
+    if (e.status === 429) {
+      res.set('Retry-After', String(e.retryAfterSec || 900));
+      return res.status(429).json({ error: e.message });
+    }
+    // Limiter DB error → allow the attempt (fail-open), never 500 the login.
+  }
+  const failLogin = async () => {
+    if (limiterAccount) await recordLoginFailure(limiterAccount[0], limiterAccount[1], clientIp(req));
+    return res.status(401).json({ error: 'invalid credentials' });
+  };
+
   if (role === 'student') {
     if (!roll_number) {
       return res.status(400).json({ error: 'roll_number is required for students' });
@@ -100,7 +126,7 @@ app.post('/api/login', ah(async (req, res) => {
     const [rows] = await db.query(
       'SELECT password, name, must_change_password FROM students WHERE roll_number = $1', [roll_number]);
     if (!rows.length || !pwVerify(password, rows[0].password)) {
-      return res.status(401).json({ error: 'invalid credentials' });
+      return failLogin();
     }
     // Upgrade legacy plaintext
     if (!rows[0].password.startsWith('pbkdf2-sha256$')) {
@@ -111,6 +137,7 @@ app.post('/api/login', ah(async (req, res) => {
     // gets one forced change at first login (frontend enforces the flow,
     // server enforces it again on every authenticated request).
     const mustChange = rows[0].must_change_password === true;
+    await clearLoginFailures('student', String(roll_number));
     const token = jwt.sign({ role: 'student', roll_number, mcp: mustChange }, JWT_SECRET, { expiresIn: '8h' });
     return res.json({ token, role: 'student', roll_number, name: rows[0].name, must_change_password: mustChange });
   }
@@ -119,12 +146,13 @@ app.post('/api/login', ah(async (req, res) => {
     const [rows] = await db.query(
       'SELECT password FROM credentials WHERE role = $1', [role]);
     if (!rows.length || !pwVerify(password, rows[0].password)) {
-      return res.status(401).json({ error: 'invalid credentials' });
+      return failLogin();
     }
     if (!rows[0].password.startsWith('pbkdf2-sha256$')) {
       const hashed = pwHash(password);
       await db.query('UPDATE credentials SET password = $1 WHERE role = $2', [hashed, role]);
     }
+    await clearLoginFailures('staff', role);
     const token = jwt.sign({ role }, JWT_SECRET, { expiresIn: '8h' });
     return res.json({ token, role });
   }
@@ -232,23 +260,35 @@ app.get('/api/requests/mine', authenticate, requireRole('student'), ah(async (re
     + 'WHERE r.student_roll_number = $1 ORDER BY r.request_number DESC', [req.session.roll_number]);
 
   // Batch-fill bus assignments
-  const [assigns] = await db.query('SELECT request_number, bus_number FROM bus_assignments');
+  const [assigns] = await db.query(
+    'SELECT a.request_number, a.bus_number, a.departure_time, b.vehicle_type '
+    + 'FROM bus_assignments a LEFT JOIN buses b ON a.bus_number = b.bus_number');
   const assignMap = {};
-  assigns.forEach(a => assignMap[a.request_number] = a.bus_number);
+  assigns.forEach(a => assignMap[a.request_number] = {
+    bus: a.bus_number, departure: a.departure_time || null, vehicle_type: a.vehicle_type || 'bus',
+  });
 
-  const result = rows.map(r => ({
-    request_number: r.request_number,
-    student_name: r.student_name,
-    roll_number: r.student_roll_number,
-    hostel: r.hostel_name,
-    room: r.room_number,
-    phone: r.phone_number,
-    pickup: r.pickup_place,
-    dropoff: r.dropoff_place,
-    status: r.status,
-    required_time: r.required_time,
-    bus: assignMap[r.request_number] || 0,
-  }));
+  const result = rows.map(r => {
+    const a = assignMap[r.request_number] || {};
+    return {
+      request_number: r.request_number,
+      student_name: r.student_name,
+      roll_number: r.student_roll_number,
+      hostel: r.hostel_name,
+      room: r.room_number,
+      phone: r.phone_number,
+      pickup: r.pickup_place,
+      dropoff: r.dropoff_place,
+      status: r.status,
+      required_time: r.required_time,
+      bus: a.bus || 0,
+      departure: a.departure || null,
+      vehicle_type: a.vehicle_type || 'bus',
+      departure_label: a.departure
+        ? new Date(a.departure).toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' })
+        : null,
+    };
+  });
 
   res.json({ count: result.length, requests: result });
 }));
@@ -271,23 +311,35 @@ app.get('/api/requests', authenticate, requireRole('guard', 'scheduler'), ah(asy
   query += ' ORDER BY r.request_number';
 
   const [rows] = await db.query(query, params);
-  const [assigns] = await db.query('SELECT request_number, bus_number FROM bus_assignments');
+  const [assigns] = await db.query(
+    'SELECT a.request_number, a.bus_number, a.departure_time, b.vehicle_type '
+    + 'FROM bus_assignments a LEFT JOIN buses b ON a.bus_number = b.bus_number');
   const assignMap = {};
-  assigns.forEach(a => assignMap[a.request_number] = a.bus_number);
+  assigns.forEach(a => assignMap[a.request_number] = {
+    bus: a.bus_number, departure: a.departure_time || null, vehicle_type: a.vehicle_type || 'bus',
+  });
 
-  const result = rows.map(r => ({
-    request_number: r.request_number,
-    student_name: r.student_name,
-    roll_number: r.student_roll_number,
-    hostel: r.hostel_name,
-    room: r.room_number,
-    phone: r.phone_number,
-    pickup: r.pickup_place,
-    dropoff: r.dropoff_place,
-    status: r.status,
-    required_time: r.required_time,
-    bus: assignMap[r.request_number] || 0,
-  }));
+  const result = rows.map(r => {
+    const a = assignMap[r.request_number] || {};
+    return {
+      request_number: r.request_number,
+      student_name: r.student_name,
+      roll_number: r.student_roll_number,
+      hostel: r.hostel_name,
+      room: r.room_number,
+      phone: r.phone_number,
+      pickup: r.pickup_place,
+      dropoff: r.dropoff_place,
+      status: r.status,
+      required_time: r.required_time,
+      bus: a.bus || 0,
+      departure: a.departure || null,
+      vehicle_type: a.vehicle_type || 'bus',
+      departure_label: a.departure
+        ? new Date(a.departure).toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' })
+        : null,
+    };
+  });
 
   res.json({ count: result.length, requests: result });
 }));
@@ -384,12 +436,23 @@ app.patch('/api/buses/:bus_number/state', authenticate, requireRole('scheduler',
   res.json({ bus_number: bn, state });
 }));
 
+// Dispatch engine v1 (FR-09/10/11): pools approved requests by route +
+// deadline, fills scheduled departures first, sizes van vs bus, enforces the
+// delay/earliness windows, and returns a per-request decision log (7.10).
+// Optional body: { max_delay_minutes, max_earliness_minutes } — defaults 30/60.
 app.post('/api/buses/assign', authenticate, requireRole('scheduler', 'admin'), ah(async (req, res) => {
   try {
-    const result = await coreAssignApprovedRequests();
+    const options = {};
+    if (req.body && req.body.max_delay_minutes !== undefined) {
+      options.maxDelayMinutes = Number(req.body.max_delay_minutes);
+    }
+    if (req.body && req.body.max_earliness_minutes !== undefined) {
+      options.maxEarlinessMinutes = Number(req.body.max_earliness_minutes);
+    }
+    const result = await coreDispatchApprovedRequests(options);
     res.json(result);
   } catch {
-    res.status(500).json({ error: 'database error during assignment' });
+    res.status(500).json({ error: 'database error during dispatch' });
   }
 }));
 
@@ -646,6 +709,45 @@ app.post('/api/admin/students/:roll/password', authenticate, requireRole('admin'
     [hash, roll]);
   if (!rowCount) return res.status(404).json({ error: 'student not found' });
   res.json({ roll, reset: true, must_change_password: true });
+}));
+
+// Brute-force monitor: which identities are racking up failures or are
+// actively blocked. Admin-only; read-only plus explicit unblock.
+app.get('/api/admin/login-failures', authenticate, requireRole('admin'), ah(async (req, res) => {
+  const [rows] = await db.query(
+    'SELECT identity_key, fail_count, window_start, blocked_until '
+    + 'FROM login_failures WHERE fail_count > 0 OR blocked_until IS NOT NULL '
+    + 'ORDER BY COALESCE(blocked_until, window_start) DESC LIMIT 100');
+  const now = Date.now();
+  const entries = rows.map(r => {
+    const blocked = r.blocked_until && new Date(r.blocked_until).getTime() > now;
+    const key = String(r.identity_key || '');
+    return {
+      identity_key: key,
+      kind: key.startsWith('ip:') ? 'ip' : key.split(':')[0],
+      id: key.includes(':') ? key.slice(key.indexOf(':') + 1) : key,
+      fail_count: r.fail_count,
+      window_start: r.window_start,
+      blocked_until: blocked ? r.blocked_until : null,
+      blocked: !!blocked,
+    };
+  });
+  res.json({
+    count: entries.length,
+    blocked_count: entries.filter(e => e.blocked).length,
+    entries,
+  });
+}));
+
+// Admin unblock: clears one identity's counter entirely.
+app.delete('/api/admin/login-failures/:key', authenticate, requireRole('admin'), ah(async (req, res) => {
+  const key = String(req.params.key || '');
+  if (!/^(student|staff|ip):[A-Za-z0-9._:-]{1,60}$/.test(key)) {
+    return res.status(400).json({ error: 'invalid identity key' });
+  }
+  const [, rowCount] = await db.query('DELETE FROM login_failures WHERE identity_key = $1', [key]);
+  if (!rowCount) return res.status(404).json({ error: 'identity not found (it may have already expired)' });
+  res.json({ cleared: key });
 }));
 
 // Central error handler — target of the ah() wrapper above.

@@ -6,9 +6,12 @@
 --   003  Sunday van service (6 vans, 12 departures)
 --   004  dispatch foundation columns (required_time, vehicle_type, state, ...)
 --   005  admin-managed student passwords (must_change_password, audit stamp)
+--   006  dispatch engine (departure-scoped assignments)
+--   007  login rate limiting (login_failures table)
 -- Ends with a sanity-check query — expect buses_total=12, vans=6,
 -- schedules_total=24, van_departures=12, buses_vehicle_typed=12, reqs_typed=1,
--- students_have_flags=1.
+-- students_have_flags=1, assignments_have_departure_time=1,
+-- login_failures_table=1.
 -- ============================================================================
 
 
@@ -190,9 +193,43 @@ CREATE INDEX IF NOT EXISTS idx_students_roll ON students(roll_number);
 
 
 -- ============================================================================
+-- MIGRATION 006: dispatch engine v1 — departure-scoped assignments
+--   bus_assignments.departure_time records WHICH scheduled run a student
+--   was dispatched onto; per-trip capacity and the decision audit need it.
+--   Legacy rows keep NULL (history from the old time-blind auto-assign).
+-- ============================================================================
+
+ALTER TABLE bus_assignments
+  ADD COLUMN IF NOT EXISTS departure_time TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_assignments_bus_departure
+  ON bus_assignments(bus_number, departure_time);
+
+
+-- ============================================================================
+-- MIGRATION 007: login rate limiting (brute-force protection)
+--   Failed-login counters live in the DB (serverless-safe, global across
+--   instances). 8 fails / 15 min per account, 30 / 15 min per IP; either
+--   cap blocks logins for that identity until the window slides shut.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS login_failures (
+  identity_key VARCHAR(64) PRIMARY KEY,
+  fail_count   INTEGER NOT NULL DEFAULT 0,
+  window_start TIMESTAMPTZ NOT NULL DEFAULT now(),
+  blocked_until TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_login_failures_window
+  ON login_failures(window_start);
+
+
+-- ============================================================================
 -- SANITY CHECK — the result grid after Run should show:
 --   buses_total 12 · vans 6 · schedules_total 24 · van_departures 12
---   buses_vehicle_typed 12 · requests_have_required_time 1 · students_have_flags 1
+--   buses_vehicle_typed 12 · requests_have_required_time 1
+--   students_have_flags 1 · assignments_have_departure_time 1
+--   login_failures_table 1
 -- ============================================================================
 SELECT
   (SELECT COUNT(*) FROM buses)                                   AS buses_total,
@@ -206,4 +243,9 @@ SELECT
   (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_name = 'students'
        AND column_name IN ('must_change_password', 'password_changed_at'))
-                                                                 AS students_have_flags;
+                                                                 AS students_have_flags,
+  (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_name = 'bus_assignments'
+       AND column_name = 'departure_time')                      AS assignments_have_departure_time,
+  (SELECT COUNT(*) FROM information_schema.tables
+     WHERE table_name = 'login_failures')                       AS login_failures_table;
