@@ -729,7 +729,9 @@ async function coreGetTrip(busNumber, departureIso) {
 const { stopPassed, isFixStale, withinDedupeWindow, plausibleFix, projectOntoSegment } = require('./geo');
 const JOIN_MAX_DELAY_MINUTES = 30;   // required_time may be up to this much in the past
 const JOIN_OFF_ROUTE_METERS = 2000;  // bus-position corridor tolerance
-const JOIN_WALK_METERS = 500;        // request stops must be within walking distance of the corridor
+// Real stops can sit ~600 m off the straight chord between endpoints (the
+// valley road bends), so this is a generous walking-distance bound.
+const JOIN_WALK_METERS = 800;        // request stops must be within walking distance of the corridor
 
 // PURE (FR-17): every hard constraint for joining a running trip, checked in
 // order, each failure a SPECIFIC code — never a silent rejection (WR-07).
@@ -757,7 +759,12 @@ function validateJoin(input) {
   if (a && b && pS && dS) {
     const pp = projectOntoSegment(pS, a, b);
     const pd = projectOntoSegment(dS, a, b);
-    if (pp.distanceM > JOIN_WALK_METERS || pd.distanceM > JOIN_WALK_METERS
+    // Both endpoints must genuinely lie BETWEEN the trip's stops (a small
+    // slack covers GPS noise): a Waknaghat stop is NOT boardable from a
+    // Peach Tree -> JUIT bus, however close the chord passes.
+    if (pp.tRaw < -0.05 || pp.tRaw > 1.05
+        || pd.tRaw < -0.05 || pd.tRaw > 1.05
+        || pp.distanceM > JOIN_WALK_METERS || pd.distanceM > JOIN_WALK_METERS
         || pd.t <= pp.t) {
       return { ok: false, code: 'route_mismatch',
         message: 'This bus does not run your way (wrong route or direction).' };

@@ -50,9 +50,9 @@ CREATE INDEX IF NOT EXISTS idx_trip_positions_latest
 -- check derives "has the bus passed my stop yet" from these coordinates via
 -- corridor projection — stop ORDER is never assumed from location indexes,
 -- so correcting a coordinate here automatically corrects the behavior.
--- NOTE: values below are APPROXIMATE along the JUIT-Waknaghat highway.
--- Ground-truth them on a map and UPDATE these rows; a NULL coordinate makes
--- the join check fail SAFE (reject with stop_coords_missing), never guess.
+-- All four coordinates USER-VERIFIED on a map (2026-09-15); a NULL
+-- coordinate still makes the join check fail SAFE (reject with
+-- stop_coords_missing), never guess.
 CREATE TABLE IF NOT EXISTS route_stops (
   location_index INTEGER PRIMARY KEY,
   name           VARCHAR(50) NOT NULL,
@@ -61,10 +61,10 @@ CREATE TABLE IF NOT EXISTS route_stops (
 );
 
 INSERT INTO route_stops (location_index, name, lat, lng) VALUES
-  (0, 'JUIT',        31.0176, 77.0735),
-  (1, 'Ravli PG',    31.0128, 77.0795),
-  (2, 'Peach Tree',  31.0092, 77.0838),
-  (3, 'Waknaghat',   31.0055, 77.0885)
+  (0, 'JUIT',        31.016747, 77.073142),
+  (1, 'Ravli PG',    31.015282, 77.085094),
+  (2, 'Peach Tree',  31.012071, 77.086437),
+  (3, 'Waknaghat',   31.008946, 77.090653)
 ON CONFLICT (location_index) DO NOTHING;
 
 

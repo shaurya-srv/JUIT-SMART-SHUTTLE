@@ -300,8 +300,8 @@ CREATE INDEX IF NOT EXISTS idx_trip_positions_latest
 
 -- Route stop coordinates for the join-running-bus engine (FR-17). Stop
 -- ORDER is derived from these coordinates by corridor projection — never
--- assumed from location indexes. NOTE: approximate values; ground-truth
--- them on a map and UPDATE. NULL coordinate = join check fails SAFE.
+-- assumed from location indexes. All four USER-VERIFIED on a map
+-- (2026-09-15). NULL = join fails SAFE.
 CREATE TABLE IF NOT EXISTS route_stops (
   location_index INTEGER PRIMARY KEY,
   name           VARCHAR(50) NOT NULL,
@@ -310,10 +310,10 @@ CREATE TABLE IF NOT EXISTS route_stops (
 );
 
 INSERT INTO route_stops (location_index, name, lat, lng) VALUES
-  (0, 'JUIT',        31.0176, 77.0735),
-  (1, 'Ravli PG',    31.0128, 77.0795),
-  (2, 'Peach Tree',  31.0092, 77.0838),
-  (3, 'Waknaghat',   31.0055, 77.0885)
+  (0, 'JUIT',        31.016747, 77.073142),
+  (1, 'Ravli PG',    31.015282, 77.085094),
+  (2, 'Peach Tree',  31.012071, 77.086437),
+  (3, 'Waknaghat',   31.008946, 77.090653)
 ON CONFLICT (location_index) DO NOTHING;
 
 

@@ -13,7 +13,9 @@ function haversineMeters(a, b) {
 }
 
 // Project `p` onto segment a→b: distance from the line (meters) + the
-// along-direction t (0 at a, 1 at b, outside clamps to the nearest end).
+// along-direction t (0 at a, 1 at b, clamped to [0,1]) and tRaw (the same
+// fraction UNCLAMPED — < 0 means beyond a, > 1 means beyond b; callers use
+// it to detect "this stop is not actually between the bus's endpoints").
 // Uses a local equirectangular frame — accurate at campus scale (km, not degrees).
 function projectOntoSegment(p, a, b) {
   const kx = Math.cos((((a.lat + b.lat) / 2) * Math.PI) / 180);
@@ -23,9 +25,10 @@ function projectOntoSegment(p, a, b) {
   const px = toM(p.lng, kx), py = toM(p.lat, 1);
   const dx = bx - ax, dy = by - ay;
   const len2 = dx * dx + dy * dy;
-  const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2));
+  const tRaw = len2 === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / len2;
+  const t = Math.max(0, Math.min(1, tRaw));
   const cx = ax + t * dx, cy = ay + t * dy;
-  return { distanceM: Math.hypot(px - cx, py - cy), t };
+  return { distanceM: Math.hypot(px - cx, py - cy), t, tRaw };
 }
 
 // Has the bus already passed the student's stop along its a→b corridor?

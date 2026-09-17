@@ -12,13 +12,15 @@ const check = (n, c, x) => {
 };
 
 // --- fixtures ---
-// Real campus corridor (approximate, along the highway):
-//   0 JUIT (31.0176,77.0735) · 1 Ravli PG (31.0128,77.0795)
-//   2 Peach Tree (31.0092,77.0838) · 3 Waknaghat (31.0055,77.0885)
+// Route stops — JUIT, Ravli PG and Peach Tree are USER-VERIFIED pins
+// (2026-09-15); Waknaghat is still the seed approximation.
+//   0 JUIT gate (31.016747,77.073142) · 1 Ravli PG (31.015282,77.085094)
+//   2 Peach Tree/Azad Bhavan ext (31.012071,77.086437)
+//   3 Waknaghat (31.0055,77.0885 — approx)
 const STOPS = {
-  0: { lat: 31.0176, lng: 77.0735 },
-  1: { lat: 31.0128, lng: 77.0795 },
-  2: { lat: 31.0092, lng: 77.0838 },
+  0: { lat: 31.016747, lng: 77.073142 },
+  1: { lat: 31.015282, lng: 77.085094 },
+  2: { lat: 31.012071, lng: 77.086437 },
   3: { lat: 31.0055, lng: 77.0885 },
 };
 const NOW = new Date('2026-09-15T03:00:00.000Z');            // 08:30 IST
@@ -49,11 +51,17 @@ check('COMPLETED request rejected', validateJoin(base({ request: req({ status: '
 
 // --- route gate: coordinate-driven (6.7 corridor membership) ---
 check('exact route joins', validateJoin(base()).ok);
-check(' Ravli student boards PeachTree->JUIT bus (corridor)', validateJoin(base({ request: req({ pickup_location: 1 }) })).ok);
+check(' Ravli student boards PeachTree->JUIT bus (corridor, 800m walk)', validateJoin(base({ request: req({ pickup_location: 1 }) })).ok);
 check('reverse direction rejected', validateJoin(base({ request: req({ pickup_location: 0, dropoff_location: 2 }) })).code === 'route_mismatch');
-check('opposite corridor rejected (Waknaghat->JUIT vs PeachTree->JUIT)', validateJoin(base({ request: req({ pickup_location: 3 }) })).code === 'route_mismatch');
+// (Waknaghat-on-PT-bus is covered below: rejected by the end-bounds rule.)
 check('dropoff beyond pickup rejected (JUIT->PeachTree on this bus)', validateJoin(base({ request: req({ dropoff_location: 3 }) })).code === 'route_mismatch');
+// Real geometry (final pins): Waknaghat projects 532 m off the PT→JUIT chord
+// and BEYOND its Peach Tree end (tRaw < 0) — the end-bounds rule must reject
+// it even though it is within the 800 m walk tolerance.
+check('Waknaghat student CANNOT board PT->JUIT bus (beyond end, 532m)', validateJoin(base({ request: req({ pickup_location: 3 }) })).code === 'route_mismatch');
 check('unmapped stops fall back to strict index equality', validateJoin(base({ stops: undefined, request: req({ pickup_location: 1 }) })).code === 'route_mismatch');
+// On the actual WK->JUIT run, a Waknaghat pickup rides t=0 → t=1: legal.
+check('Waknaghat->JUIT rides the full WK->JUIT run', validateJoin(base({ request: req({ pickup_location: 3, dropoff_location: 0 }), trip: trip({ route_pickup: 3, route_dropoff: 0 }) })).ok);
 
 // --- window gate (6.9): required_time may be at most 30 min past ---
 check('required_time 10 min ahead ok', validateJoin(base()).ok);
@@ -71,14 +79,14 @@ check('en-route with stale fix rejected', validateJoin(moving({ gps: { ...freshG
 check('en-route without gps rejected', validateJoin(moving({ gps: undefined })).code === 'no_live_tracking');
 check('en-route unmapped stops fail SAFE', validateJoin(moving({ stops: undefined })).code === 'stop_coords_missing');
 // On a linear route the origin stop is behind the bus the moment it moves:
-// a bus at t=0.2 has passed Peach Tree (t=0) — that student cannot join.
-const busAt02 = freshGps({ lat: 31.0109, lng: 77.0817 });
-check('origin-stop student rejected once bus moved', validateJoin(moving({ gps: busAt02 })).code === 'stop_already_passed');
-// The Ravli student (t≈0.42) is still ahead of that same bus → joins.
-check('mid-corridor student ahead of bus joins', validateJoin(moving({ gps: busAt02, request: req({ pickup_location: 1 }) })).ok);
-// Bus past Ravli PG (t=0.7) — now the Ravli student is behind too.
-const busAt07 = freshGps({ lat: 31.0150, lng: 77.0765 });
-check('mid-corridor student rejected once bus passed', validateJoin(moving({ gps: busAt07, request: req({ pickup_location: 1 }) })).code === 'stop_already_passed');
+// a bus at t≈0.1 on the real PT→JUIT chord has passed Peach Tree (t=0).
+const busAt01 = freshGps({ lat: 31.012539, lng: 77.085108 });
+check('origin-stop student rejected once bus moved', validateJoin(moving({ gps: busAt01 })).code === 'stop_already_passed');
+// The Ravli student (t≈0.19 on the chord, real pin 282 m off) is ahead → joins.
+check('mid-corridor student ahead of bus joins', validateJoin(moving({ gps: busAt01, request: req({ pickup_location: 1 }) })).ok);
+// Bus past Ravli (t≈0.5) — now the Ravli student is behind too.
+const busAt05 = freshGps({ lat: 31.014409, lng: 77.079789 });
+check('mid-corridor student rejected once bus passed', validateJoin(moving({ gps: busAt05, request: req({ pickup_location: 1 }) })).code === 'stop_already_passed');
 check('bus far off corridor rejected', validateJoin(moving({ gps: freshGps({ lat: 31.0500, lng: 77.1500 }) })).code === 'bus_off_route');
 // DEPARTED runs the identical moving-bus gate (default fixture bus t≈0.09
 // has left Peach Tree, so the Peach Tree student is rejected by it).
