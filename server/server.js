@@ -76,11 +76,17 @@ app.get('/api/health', ah(async (req, res) => {
   // instantly (hostnames/usernames are not secrets; the password never is).
   try {
     const [r] = await db.query('SELECT current_user AS db_user');
+    // current_user shows the demangled role through the pooler (always
+    // "postgres"), so it cannot distinguish projects. The *_env echoes below
+    // print exactly what this function instance received — a misnamed, unset,
+    // or wrong-valued Vercel variable becomes visible instantly.
     res.json({
       status: 'ok',
       database: 'up',
       db_host: process.env.SHUTTLE_DB_HOST || '(default)',
       db_user: r[0].db_user,
+      db_user_env: process.env.SHUTTLE_DB_USER || '(unset)',
+      db_port_env: process.env.SHUTTLE_DB_PORT || '(unset)',
     });
   } catch {
     res.json({
